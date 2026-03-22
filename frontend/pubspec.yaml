@@ -1,0 +1,43 @@
+name: vita_ai
+description: "AI Medical Assistant App"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # Backend HTTP client (existing)
+  http: ^1.2.0
+
+  # Web interop (for browser-native FormData uploads)
+  web: ^1.0.0
+
+  # Voice & Breath Recording (from new UI)
+  flutter_sound: ^9.2.13
+  permission_handler: ^11.3.1
+  path_provider: ^2.1.5
+
+  # Camera + Face Detection (from new UI)
+  camera: ^0.12.0
+
+  # Open external links (from new UI)
+  url_launcher: ^6.2.6
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/bg.jpg
+
