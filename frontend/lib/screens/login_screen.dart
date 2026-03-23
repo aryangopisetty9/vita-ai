@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import '../services/api_service.dart';
 import '../models/health_data.dart';
 import 'home_screen.dart';
@@ -26,6 +27,32 @@ class _LoginScreenState extends State<LoginScreen> {
     _emailCtrl.dispose();
     _passCtrl.dispose();
     super.dispose();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    // If OAuth redirected back with a token in the query (web), apply it.
+    if (kIsWeb) {
+      final token = Uri.base.queryParameters['token'];
+      if (token != null && token.isNotEmpty) {
+        ApiService.setToken(token);
+        // Fetch profile and navigate to home
+        ApiService.getProfile().then((profile) {
+          if (!mounted) return;
+          final user = profile;
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (_) => HomeScreen(
+                userId: user['id'] as int? ?? 0,
+                userName: user['name'] as String? ?? 'User',
+              ),
+            ),
+          );
+        }).catchError((_) {});
+      }
+    }
   }
 
   Future<void> _login() async {
@@ -150,23 +177,21 @@ class _LoginScreenState extends State<LoginScreen> {
                             const Color(0xFF1877F2),
                             Icons.facebook,
                             'Continue with Facebook',
-                            () => _openUrl('https://www.facebook.com/login'),
+                            () => _openUrl('${ApiService.baseUrl}/auth/oauth/facebook/login'),
                           ),
                           const SizedBox(height: 10),
                           _socialButton(
                             Colors.red,
                             Icons.g_mobiledata,
                             'Continue with Google',
-                            () => _openUrl(
-                                'https://accounts.google.com/signin'),
+                            () => _openUrl('${ApiService.baseUrl}/auth/oauth/google/login'),
                           ),
                           const SizedBox(height: 10),
                           _socialButton(
                             Colors.black,
                             Icons.apple,
                             'Continue with Apple',
-                            () => _openUrl(
-                                'https://appleid.apple.com/sign-in'),
+                            () => _openUrl('${ApiService.baseUrl}/auth/oauth/apple/login'),
                           ),
                           const SizedBox(height: 20),
 

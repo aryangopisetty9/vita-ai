@@ -43,13 +43,24 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Depends
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    Depends,
+    Request,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 # are importable regardless of the working directory.
@@ -87,6 +98,10 @@ from backend.app.services import patient_crud
 from backend.app.services import sos_service  # SOS feature integrated from Manogna
 from backend.app.services.encryption_service import encrypt_field, decrypt_field  # Security/encryption logic adapted from Manogna's backend
 from sqlalchemy.orm import Session
+import requests
+import base64
+import uuid as _uuid
+from jose import jwt as jose_jwt
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -343,6 +358,242 @@ def api_info():
             "WS   /ws/audio-stream",
         ],
     }
+
+
+# ── OAuth helpers and endpoints for Google / Facebook / Apple
+def _frontend_target() -> str | None:
+    """Frontend URL that OAuth callbacks should redirect to (optional).
+
+    Set the environment variable `VITA_FRONTEND_URL` in deployments to the
+    public URL of the frontend (e.g. https://app.example.com). If not set,
+    the callback handler will return a small HTML page that stores the JWT
+    in localStorage and redirects to '/'.
+    """
+    return os.getenv("VITA_FRONTEND_URL")
+
+
+def _make_html_token_response(token: str, redirect_to: str | None = None) -> HTMLResponse:
+    """Return a tiny HTML page that stores the token in localStorage and
+    redirects the browser to the frontend.
+    """
+    target = redirect_to or "/"
+    html = f"""<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Signing you in…</title></head>
+  <body>
+    <script>
+      try {{
+        localStorage.setItem('vita_token', '{token}');
+      }} catch(e) {{}}
+      window.location.href = '{target}';
+    </script>
+    <noscript>
+      <p>Sign-in successful. Navigate to <a href="{target}">{target}</a></p>
+    </noscript>
+  </body>
+</html>"""
+    return HTMLResponse(content=html, status_code=200)
+
+
+def _get_or_create_user_by_email(db: Session, email: str, name: str):
+    """Find an existing user by email or create a new one with a random
+    password hash so that the account is usable by the rest of the system.
+    """
+    user = db.query(User).filter(User.email == email).first()
+    if user:
+        if name and user.name != name:
+            user.name = name
+            db.commit()
+            db.refresh(user)
+        return user
+
+    # Create a user with a random password hash
+    random_pw = _uuid.uuid4().hex
+    user = User(name=name or 'User', email=email, password_hash=hash_password(random_pw))
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.get('/auth/oauth/{provider}/login', include_in_schema=False)
+def oauth_login(provider: str, request: Request):
+    """Redirect the user to the provider's authorization page.
+
+    Supported providers: google, facebook, apple
+    """
+    provider = provider.lower()
+    redirect_uri = request.url_for('oauth_callback', provider=provider)
+
+    if provider == 'google':
+        client_id = os.getenv('VITA_GOOGLE_CLIENT_ID')
+        scope = 'openid email profile'
+        auth_url = 'https://accounts.google.com/o/oauth2/v2/auth'
+        params = {
+            'client_id': client_id,
+            'response_type': 'code',
+            'scope': scope,
+            'redirect_uri': redirect_uri,
+            'access_type': 'offline',
+            'prompt': 'consent',
+        }
+    elif provider == 'facebook':
+        client_id = os.getenv('VITA_FACEBOOK_CLIENT_ID')
+        scope = 'email'
+        auth_url = 'https://www.facebook.com/v12.0/dialog/oauth'
+        params = {
+            'client_id': client_id,
+            'response_type': 'code',
+            'scope': scope,
+            'redirect_uri': redirect_uri,
+        }
+    elif provider == 'apple':
+        client_id = os.getenv('VITA_APPLE_CLIENT_ID')
+        scope = 'name email'
+        auth_url = 'https://appleid.apple.com/auth/authorize'
+        params = {
+            'client_id': client_id,
+            'response_type': 'code',
+            'scope': scope,
+            'redirect_uri': redirect_uri,
+            'response_mode': 'form_post',
+        }
+    else:
+        raise HTTPException(status_code=400, detail='Unsupported OAuth provider')
+
+    if not client_id:
+        raise HTTPException(status_code=500, detail=f'Missing client id for {provider}. Set environment variable.')
+
+    # Build query string and redirect
+    from urllib.parse import urlencode
+    url = auth_url + '?' + urlencode(params)
+    return RedirectResponse(url)
+
+
+@app.get('/auth/oauth/{provider}/callback', name='oauth_callback', include_in_schema=False)
+def oauth_callback(provider: str, request: Request, db: Session = Depends(get_db)):
+    """Handle provider callback: exchange code for token, fetch user info,
+    create/login local user, and return a token to the frontend.
+    """
+    provider = provider.lower()
+    code = request.query_params.get('code')
+    if not code:
+        raise HTTPException(status_code=400, detail='Missing code from provider')
+
+    try:
+        if provider == 'google':
+            token_resp = requests.post(
+                'https://oauth2.googleapis.com/token',
+                data={
+                    'code': code,
+                    'client_id': os.getenv('VITA_GOOGLE_CLIENT_ID'),
+                    'client_secret': os.getenv('VITA_GOOGLE_CLIENT_SECRET'),
+                    'redirect_uri': request.url_for('oauth_callback', provider='google'),
+                    'grant_type': 'authorization_code',
+                },
+                timeout=10,
+            )
+            token_json = token_resp.json()
+            access_token = token_json.get('access_token')
+            if not access_token:
+                raise HTTPException(status_code=400, detail='Failed to obtain access token from Google')
+            userinfo = requests.get('https://openidconnect.googleapis.com/v1/userinfo', headers={'Authorization': f'Bearer {access_token}'}, timeout=10).json()
+            email = userinfo.get('email')
+            name = userinfo.get('name') or userinfo.get('given_name') or (email.split('@')[0] if email else 'GoogleUser')
+
+        elif provider == 'facebook':
+            token_resp = requests.get(
+                'https://graph.facebook.com/v12.0/oauth/access_token',
+                params={
+                    'client_id': os.getenv('VITA_FACEBOOK_CLIENT_ID'),
+                    'client_secret': os.getenv('VITA_FACEBOOK_CLIENT_SECRET'),
+                    'redirect_uri': request.url_for('oauth_callback', provider='facebook'),
+                    'code': code,
+                },
+                timeout=10,
+            )
+            token_json = token_resp.json()
+            access_token = token_json.get('access_token')
+            if not access_token:
+                raise HTTPException(status_code=400, detail='Failed to obtain access token from Facebook')
+            userinfo = requests.get('https://graph.facebook.com/me', params={'access_token': access_token, 'fields': 'id,name,email'}, timeout=10).json()
+            email = userinfo.get('email')
+            name = userinfo.get('name') or (email.split('@')[0] if email else 'FacebookUser')
+
+        elif provider == 'apple':
+            # Apple uses a POST form response for code exchange; client secret must be a signed JWT
+            client_id = os.getenv('VITA_APPLE_CLIENT_ID')
+            team_id = os.getenv('VITA_APPLE_TEAM_ID')
+            key_id = os.getenv('VITA_APPLE_KEY_ID')
+            private_key = os.getenv('VITA_APPLE_PRIVATE_KEY')  # PEM encoded private key
+            if not (client_id and team_id and key_id and private_key):
+                raise HTTPException(status_code=500, detail='Missing Apple OAuth credentials (VITA_APPLE_*)')
+
+            now = int(datetime.utcnow().timestamp())
+            client_secret = jose_jwt.encode(
+                {
+                    'iss': team_id,
+                    'iat': now,
+                    'exp': now + 86400 * 180,
+                    'aud': 'https://appleid.apple.com',
+                    'sub': client_id,
+                },
+                private_key,
+                algorithm='ES256',
+                headers={'kid': key_id},
+            )
+
+            token_resp = requests.post(
+                'https://appleid.apple.com/auth/token',
+                data={
+                    'client_id': client_id,
+                    'client_secret': client_secret,
+                    'code': code,
+                    'grant_type': 'authorization_code',
+                    'redirect_uri': request.url_for('oauth_callback', provider='apple'),
+                },
+                timeout=10,
+            )
+            token_json = token_resp.json()
+            access_token = token_json.get('access_token')
+            id_token = token_json.get('id_token')
+            # id_token is a JWT containing the user's email and (optionally) name
+            if id_token:
+                try:
+                    claims = jose_jwt.decode(id_token, options={"verify_signature": False})
+                    email = claims.get('email')
+                    name = claims.get('name') or (email.split('@')[0] if email else 'AppleUser')
+                except Exception:
+                    email = None
+                    name = 'AppleUser'
+            else:
+                email = None
+                name = 'AppleUser'
+
+        else:
+            raise HTTPException(status_code=400, detail='Unsupported OAuth provider')
+
+        if not email:
+            # Email is required by the application to create a local user
+            raise HTTPException(status_code=400, detail='OAuth provider did not return an email address')
+
+        # Create or find user
+        user = _get_or_create_user_by_email(db, email=email, name=name)
+        token = create_access_token({"sub": user.email})
+
+        # Redirect to frontend or return HTML that stores token in localStorage
+        frontend = _frontend_target()
+        if frontend:
+            dest = frontend.rstrip('/') + f'/?token={token}'
+            return RedirectResponse(dest)
+
+        return _make_html_token_response(token)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception('OAuth callback handling failed: %s', exc)
+        raise HTTPException(status_code=500, detail='OAuth processing failed')
 
 
 @app.get("/health", tags=["General"])

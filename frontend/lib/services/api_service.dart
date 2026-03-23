@@ -70,6 +70,13 @@ class ApiService {
     return data;
   }
 
+  /// Get current authenticated user's profile (GET /auth/me)
+  static Future<Map<String, dynamic>> getProfile() async {
+    final resp = await http.get(Uri.parse('$baseUrl/auth/me'), headers: _jsonHeaders);
+    if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
   // ── Health check ─────────────────────────────────────────────────────
 
   static Future<bool> healthCheck() async {
