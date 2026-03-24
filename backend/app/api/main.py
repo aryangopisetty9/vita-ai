@@ -427,22 +427,31 @@ def oauth_login(provider: str, request: Request):
 
     if provider == 'google':
         client_id = os.getenv('VITA_GOOGLE_CLIENT_ID')
+        client_secret = os.getenv('VITA_GOOGLE_CLIENT_SECRET')
         scope = 'openid email profile'
         auth_url = 'https://accounts.google.com/o/oauth2/v2/auth'
-        # Validate configured redirect URI matches what Google Cloud expects
+        # Required configured redirect URI (must match Google Cloud Console)
         configured = os.getenv('VITA_GOOGLE_REDIRECT_URI')
-        if not configured:
-            raise HTTPException(status_code=500, detail='VITA_GOOGLE_REDIRECT_URI is not set in environment')
-        # request.url_for returns an absolute URL; ensure exact match
-        if str(redirect_uri) != str(configured):
-            logger.error('OAuth redirect_uri mismatch: computed=%s configured=%s', redirect_uri, configured)
-            raise HTTPException(status_code=500, detail='Redirect URI mismatch: ensure VITA_GOOGLE_REDIRECT_URI matches the backend callback URL')
+        if not client_id or not client_secret or not configured:
+            missing = [n for n, v in (
+                ('VITA_GOOGLE_CLIENT_ID', client_id),
+                ('VITA_GOOGLE_CLIENT_SECRET', client_secret),
+                ('VITA_GOOGLE_REDIRECT_URI', configured),
+            ) if not v]
+            raise HTTPException(status_code=500, detail=f'Missing required Google OAuth env vars: {", ".join(missing)}')
 
+        # request.url_for returns an absolute URL; log mismatch but use configured value
+        computed = str(redirect_uri)
+        if computed != str(configured):
+            logger.warning('VITA_GOOGLE_REDIRECT_URI does not match computed callback URL. configured=%s computed=%s', configured, computed)
+
+        # Use the configured redirect URI when constructing the authorization URL
+        redirect_uri_param = configured
         params = {
             'client_id': client_id,
             'response_type': 'code',
             'scope': scope,
-            'redirect_uri': redirect_uri,
+            'redirect_uri': redirect_uri_param,
             'access_type': 'offline',
             'prompt': 'select_account',
             'include_granted_scopes': 'true',
@@ -494,17 +503,34 @@ def oauth_callback(provider: str, request: Request, db: Session = Depends(get_db
 
     try:
         if provider == 'google':
-            token_resp = requests.post(
-                'https://oauth2.googleapis.com/token',
-                data={
-                    'code': code,
-                    'client_id': os.getenv('VITA_GOOGLE_CLIENT_ID'),
-                    'client_secret': os.getenv('VITA_GOOGLE_CLIENT_SECRET'),
-                    'redirect_uri': request.url_for('oauth_callback', provider='google'),
-                    'grant_type': 'authorization_code',
-                },
-                timeout=10,
-            )
+                # Ensure required env vars are present and use configured redirect URI
+                client_id = os.getenv('VITA_GOOGLE_CLIENT_ID')
+                client_secret = os.getenv('VITA_GOOGLE_CLIENT_SECRET')
+                configured = os.getenv('VITA_GOOGLE_REDIRECT_URI')
+                if not client_id or not client_secret or not configured:
+                    missing = [n for n, v in (
+                        ('VITA_GOOGLE_CLIENT_ID', client_id),
+                        ('VITA_GOOGLE_CLIENT_SECRET', client_secret),
+                        ('VITA_GOOGLE_REDIRECT_URI', configured),
+                    ) if not v]
+                    raise HTTPException(status_code=500, detail=f'Missing required Google OAuth env vars: {", ".join(missing)}')
+
+                # Log if computed callback doesn't match configured, but use configured when exchanging token
+                computed = str(request.url_for('oauth_callback', provider='google'))
+                if computed != str(configured):
+                    logger.warning('Google callback URL mismatch during token exchange: configured=%s computed=%s', configured, computed)
+
+                token_resp = requests.post(
+                    'https://oauth2.googleapis.com/token',
+                    data={
+                        'code': code,
+                        'client_id': client_id,
+                        'client_secret': client_secret,
+                        'redirect_uri': configured,
+                        'grant_type': 'authorization_code',
+                    },
+                    timeout=10,
+                )
             token_json = token_resp.json()
             access_token = token_json.get('access_token')
             if not access_token:
