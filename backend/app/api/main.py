@@ -429,13 +429,23 @@ def oauth_login(provider: str, request: Request):
         client_id = os.getenv('VITA_GOOGLE_CLIENT_ID')
         scope = 'openid email profile'
         auth_url = 'https://accounts.google.com/o/oauth2/v2/auth'
+        # Validate configured redirect URI matches what Google Cloud expects
+        configured = os.getenv('VITA_GOOGLE_REDIRECT_URI')
+        if not configured:
+            raise HTTPException(status_code=500, detail='VITA_GOOGLE_REDIRECT_URI is not set in environment')
+        # request.url_for returns an absolute URL; ensure exact match
+        if str(redirect_uri) != str(configured):
+            logger.error('OAuth redirect_uri mismatch: computed=%s configured=%s', redirect_uri, configured)
+            raise HTTPException(status_code=500, detail='Redirect URI mismatch: ensure VITA_GOOGLE_REDIRECT_URI matches the backend callback URL')
+
         params = {
             'client_id': client_id,
             'response_type': 'code',
             'scope': scope,
             'redirect_uri': redirect_uri,
             'access_type': 'offline',
-            'prompt': 'consent',
+            'prompt': 'select_account',
+            'include_granted_scopes': 'true',
         }
     elif provider == 'facebook':
         client_id = os.getenv('VITA_FACEBOOK_CLIENT_ID')
@@ -467,6 +477,8 @@ def oauth_login(provider: str, request: Request):
     # Build query string and redirect
     from urllib.parse import urlencode
     url = auth_url + '?' + urlencode(params)
+    # Log the exact OAuth URL for debugging (do not log client_secret)
+    logger.info('OAuth %s login URL: %s', provider, url)
     return RedirectResponse(url)
 
 
