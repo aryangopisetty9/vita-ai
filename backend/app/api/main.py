@@ -503,34 +503,34 @@ def oauth_callback(provider: str, request: Request, db: Session = Depends(get_db
 
     try:
         if provider == 'google':
-                # Ensure required env vars are present and use configured redirect URI
-                client_id = os.getenv('VITA_GOOGLE_CLIENT_ID')
-                client_secret = os.getenv('VITA_GOOGLE_CLIENT_SECRET')
-                configured = os.getenv('VITA_GOOGLE_REDIRECT_URI')
-                if not client_id or not client_secret or not configured:
-                    missing = [n for n, v in (
-                        ('VITA_GOOGLE_CLIENT_ID', client_id),
-                        ('VITA_GOOGLE_CLIENT_SECRET', client_secret),
-                        ('VITA_GOOGLE_REDIRECT_URI', configured),
-                    ) if not v]
-                    raise HTTPException(status_code=500, detail=f'Missing required Google OAuth env vars: {", ".join(missing)}')
+            # Ensure required env vars are present and use configured redirect URI
+            client_id = os.getenv('VITA_GOOGLE_CLIENT_ID')
+            client_secret = os.getenv('VITA_GOOGLE_CLIENT_SECRET')
+            configured = os.getenv('VITA_GOOGLE_REDIRECT_URI')
+            if not client_id or not client_secret or not configured:
+                missing = [n for n, v in (
+                    ('VITA_GOOGLE_CLIENT_ID', client_id),
+                    ('VITA_GOOGLE_CLIENT_SECRET', client_secret),
+                    ('VITA_GOOGLE_REDIRECT_URI', configured),
+                ) if not v]
+                raise HTTPException(status_code=500, detail=f'Missing required Google OAuth env vars: {", ".join(missing)}')
 
-                # Log if computed callback doesn't match configured, but use configured when exchanging token
-                computed = str(request.url_for('oauth_callback', provider='google'))
-                if computed != str(configured):
-                    logger.warning('Google callback URL mismatch during token exchange: configured=%s computed=%s', configured, computed)
+            # Log if computed callback doesn't match configured, but use configured when exchanging token
+            computed = str(request.url_for('oauth_callback', provider='google'))
+            if computed != str(configured):
+                logger.warning('Google callback URL mismatch during token exchange: configured=%s computed=%s', configured, computed)
 
-                token_resp = requests.post(
-                    'https://oauth2.googleapis.com/token',
-                    data={
-                        'code': code,
-                        'client_id': client_id,
-                        'client_secret': client_secret,
-                        'redirect_uri': configured,
-                        'grant_type': 'authorization_code',
-                    },
-                    timeout=10,
-                )
+            token_resp = requests.post(
+                'https://oauth2.googleapis.com/token',
+                data={
+                    'code': code,
+                    'client_id': client_id,
+                    'client_secret': client_secret,
+                    'redirect_uri': configured,
+                    'grant_type': 'authorization_code',
+                },
+                timeout=10,
+            )
             token_json = token_resp.json()
             access_token = token_json.get('access_token')
             if not access_token:
