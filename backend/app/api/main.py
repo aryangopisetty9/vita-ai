@@ -16,7 +16,7 @@ Running
 -------
 ::
 
-    uvicorn backend.app.api.main:app --reload
+    uvicorn backend.app.api.main:app --host 0.0.0.0 --port 8000 --reload
 
 Integration notes
 -----------------
@@ -42,9 +42,12 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote, urlencode, urlparse
+from typing import Any
 
 import numpy as np
 
@@ -57,6 +60,7 @@ from fastapi import (
     WebSocketDisconnect,
     Depends,
     Request,
+    BackgroundTasks,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
@@ -65,9 +69,10 @@ from fastapi.staticfiles import StaticFiles
 
 # are importable regardless of the working directory.
 
-from backend.app.core.config import API_DESCRIPTION, API_TITLE, API_VERSION, CORS_ORIGINS
+from backend.app.core.config import API_DESCRIPTION, API_TITLE, API_VERSION, CORS_ORIGINS, BASE_DIR
 from backend.app.ml.audio.audio_module import analyze_audio
 from backend.app.ml.face.face_module import FaceStreamProcessor, analyze_face_video
+from backend.app.ml.face.live_signal import analyze_live_face_signal
 from backend.app.ml.fusion.score_engine import compute_vita_score
 from backend.app.ml.nlp.symptom_module import analyze_symptoms, analyze_symptoms_structured
 from backend.app.ml.face.rppg_models import get_available_models as get_rppg_models
@@ -83,6 +88,8 @@ from backend.app.services.session_manager import session_manager
 from backend.app.db.schemas import FaceScanResult, FinalScoreRequest, SymptomRequest
 from backend.app.db.schemas import (
     SignupRequest, LoginRequest, UserResponse,
+    UpdateProfileRequest, ChangePasswordRequest,
+    FaceLiveSignalRequest,
     HealthDataRequest, HealthDataResponse, ScanResultResponse,
     PatientCreate, PatientUpdate, PatientResponse, PatientRecordResponse,
     AnalyzeRequest, LoginResponse,
@@ -102,6 +109,7 @@ import requests
 import base64
 import uuid as _uuid
 from jose import jwt as jose_jwt
+import httpx
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -111,6 +119,10 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
 logger = logging.getLogger("vita_api")
+
+# In-memory async jobs for live face scan processing.
+_face_live_jobs: dict[str, dict] = {}
+_face_live_jobs_lock = asyncio.Lock()
 
 # Flag for the WebSocket handler – needs cv2 to decode JPEG frames
 try:
@@ -146,6 +158,59 @@ register_exception_handlers(app)
 
 # Mount streaming sub-router (audio WebSocket)
 app.include_router(streaming_router)
+
+# Simple in-memory OAuth state store (production: use persistent store/redis)
+_oauth_state_store: dict = {}
+_OAUTH_STATE_TTL = 300  # seconds
+
+def _set_oauth_state(
+    state: str,
+    provider: str,
+    created_at: float | None = None,
+    frontend_url: str | None = None,
+) -> None:
+    _oauth_state_store[state] = {
+        "provider": provider,
+        "created_at": created_at or time.monotonic(),
+        "frontend_url": frontend_url,
+    }
+
+def _pop_oauth_state(state: str, provider: str) -> dict | None:
+    entry = _oauth_state_store.get(state)
+    if not entry or entry.get("provider") != provider:
+        return None
+    created = entry.get("created_at", 0)
+    # expire stale states
+    if time.monotonic() - created > _OAUTH_STATE_TTL:
+        _oauth_state_store.pop(state, None)
+        return None
+    _oauth_state_store.pop(state, None)
+    return entry
+
+
+def _normalise_frontend_url(raw: str | None) -> str | None:
+    """Return a safe frontend origin/path URL or None if invalid."""
+    if not raw:
+        return None
+    val = raw.strip()
+    if not val:
+        return None
+    parsed = urlparse(val)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path.rstrip("/") if parsed.path and parsed.path != "/" else ""
+    return base + path
+
+
+def _frontend_from_request(request: Request) -> str | None:
+    """Infer frontend URL from request headers for same-window OAuth return."""
+    origin = request.headers.get("origin")
+    parsed_origin = _normalise_frontend_url(origin)
+    if parsed_origin:
+        return parsed_origin
+    referer = request.headers.get("referer")
+    return _normalise_frontend_url(referer)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -337,6 +402,8 @@ def api_info():
             "POST /auth/login",
             "GET  /auth/me",
             "POST /predict/face",
+            "POST /predict/video",
+            "POST /predict/face-live",
             "POST /predict/audio",
             "POST /predict/symptom",
             "POST /predict/final-score",
@@ -361,6 +428,84 @@ def api_info():
 
 
 # ── OAuth helpers and endpoints for Google / Facebook / Apple
+def _oauth_debug_enabled() -> bool:
+    return os.getenv("VITA_OAUTH_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _oauth_log(message: str, **kwargs) -> None:
+    if not _oauth_debug_enabled():
+        return
+    safe = {}
+    for k, v in kwargs.items():
+        if any(s in k.lower() for s in ("secret", "token", "key", "password")):
+            safe[k] = "***"
+        else:
+            safe[k] = v
+    logger.info("[OAuth] %s | %s", message, safe)
+
+
+def _load_env_kv_file(path: Path) -> None:
+    """Minimal KEY=VALUE loader for local .env fallback."""
+    if not path.is_file():
+        return
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and not os.getenv(key):
+                os.environ[key] = value
+    except OSError:
+        pass
+
+
+def _ensure_oauth_env_loaded() -> None:
+    """Load local .env files on-demand if OAuth vars are not in process env."""
+    required = (
+        "VITA_GOOGLE_CLIENT_ID",
+        "VITA_GOOGLE_CLIENT_SECRET",
+        "VITA_GOOGLE_REDIRECT_URI",
+        "VITA_FRONTEND_URL",
+    )
+    if all(os.getenv(k) for k in required):
+        return
+    _load_env_kv_file(BASE_DIR / ".env")
+    _load_env_kv_file(BASE_DIR / "backend" / ".env")
+
+
+def _google_client_id() -> str | None:
+    return os.getenv("VITA_GOOGLE_CLIENT_ID") or os.getenv("GOOGLE_CLIENT_ID")
+
+
+def _google_client_secret() -> str | None:
+    return os.getenv("VITA_GOOGLE_CLIENT_SECRET") or os.getenv("GOOGLE_CLIENT_SECRET")
+
+
+def _google_redirect_uri() -> str:
+    return (
+        os.getenv("VITA_GOOGLE_REDIRECT_URI")
+        or os.getenv("GOOGLE_REDIRECT_URI")
+        or "http://localhost:8000/auth/oauth/google/callback"
+    )
+
+
+def _looks_like_placeholder(value: str | None) -> bool:
+    if not value:
+        return True
+    v = value.strip().lower()
+    return (
+        not v
+        or "paste_" in v
+        or "your_" in v
+        or "_here" in v
+        or "example" in v
+        or "changeme" in v
+    )
+
+
 def _frontend_target() -> str | None:
     """Frontend URL that OAuth callbacks should redirect to (optional).
 
@@ -369,21 +514,30 @@ def _frontend_target() -> str | None:
     the callback handler will return a small HTML page that stores the JWT
     in localStorage and redirects to '/'.
     """
-    return os.getenv("VITA_FRONTEND_URL")
+    frontend_env = os.getenv("VITA_FRONTEND_URL") or os.getenv("FRONTEND_URL")
+    return _normalise_frontend_url(frontend_env) or "http://localhost:8000"
 
 
-def _make_html_token_response(token: str, redirect_to: str | None = None) -> HTMLResponse:
+def _make_html_token_response(token: str, redirect_to: str | None = None, error: str | None = None) -> HTMLResponse:
     """Return a tiny HTML page that stores the token in localStorage and
     redirects the browser to the frontend.
     """
     target = redirect_to or "/"
+    if token:
+        joiner = "&" if "?" in target else "?"
+        target = f"{target}{joiner}token={quote(token)}"
+    if error:
+        joiner = "&" if "?" in target else "?"
+        target = f"{target}{joiner}oauth_error={quote(error)}"
     html = f"""<!doctype html>
 <html>
   <head><meta charset="utf-8"><title>Signing you in…</title></head>
   <body>
     <script>
       try {{
-        localStorage.setItem('vita_token', '{token}');
+                if ('{token}') {{
+                    localStorage.setItem('vita_token', '{token}');
+                }}
       }} catch(e) {{}}
       window.location.href = '{target}';
     </script>
@@ -393,6 +547,14 @@ def _make_html_token_response(token: str, redirect_to: str | None = None) -> HTM
   </body>
 </html>"""
     return HTMLResponse(content=html, status_code=200)
+
+
+def _oauth_error_response(message: str, status_code: int = 400, frontend: str | None = None):
+    frontend = _normalise_frontend_url(frontend) or _frontend_target()
+    if frontend:
+        dest = frontend.rstrip('/') + f'/?oauth_error={quote(message)}'
+        return RedirectResponse(dest, status_code=302)
+    return _make_html_token_response('', redirect_to='/', error=message)
 
 
 def _get_or_create_user_by_email(db: Session, email: str, name: str):
@@ -422,150 +584,207 @@ def oauth_login(provider: str, request: Request):
 
     Supported providers: google, facebook, apple
     """
-    provider = provider.lower()
-    redirect_uri = request.url_for('oauth_callback', provider=provider)
+    provider = provider.lower().strip()
+    _ensure_oauth_env_loaded()
+    state = _uuid.uuid4().hex
+    frontend_hint = _frontend_from_request(request) or _frontend_target()
+    _set_oauth_state(state, provider, frontend_url=frontend_hint)
+    _oauth_log("oauth start", provider=provider, state=state)
 
     if provider == 'google':
-        client_id = os.getenv('VITA_GOOGLE_CLIENT_ID')
-        client_secret = os.getenv('VITA_GOOGLE_CLIENT_SECRET')
-        scope = 'openid email profile'
-        auth_url = 'https://accounts.google.com/o/oauth2/v2/auth'
-        # Required configured redirect URI (must match Google Cloud Console)
-        configured = os.getenv('VITA_GOOGLE_REDIRECT_URI')
-        if not client_id or not client_secret or not configured:
+        client_id = _google_client_id()
+        client_secret = _google_client_secret()
+        configured_redirect = _google_redirect_uri()
+        if _looks_like_placeholder(client_id) or _looks_like_placeholder(client_secret):
             missing = [n for n, v in (
                 ('VITA_GOOGLE_CLIENT_ID', client_id),
                 ('VITA_GOOGLE_CLIENT_SECRET', client_secret),
-                ('VITA_GOOGLE_REDIRECT_URI', configured),
-            ) if not v]
-            raise HTTPException(status_code=500, detail=f'Missing required Google OAuth env vars: {", ".join(missing)}')
+            ) if _looks_like_placeholder(v)]
+            return _oauth_error_response(
+                f'Missing required Google OAuth env vars: {", ".join(missing)}',
+                status_code=500,
+                frontend=frontend_hint,
+            )
 
-        # request.url_for returns an absolute URL; log mismatch but use configured value
-        computed = str(redirect_uri)
-        if computed != str(configured):
-            logger.warning('VITA_GOOGLE_REDIRECT_URI does not match computed callback URL. configured=%s computed=%s', configured, computed)
-
-        # Use the configured redirect URI when constructing the authorization URL
-        redirect_uri_param = configured
         params = {
             'client_id': client_id,
+            'redirect_uri': configured_redirect,
             'response_type': 'code',
-            'scope': scope,
-            'redirect_uri': redirect_uri_param,
-            'access_type': 'offline',
+            'scope': 'openid email profile',
             'prompt': 'select_account',
+            'access_type': 'offline',
             'include_granted_scopes': 'true',
+            'state': state,
         }
+        auth_url = 'https://accounts.google.com/o/oauth2/v2/auth'
+
     elif provider == 'facebook':
         client_id = os.getenv('VITA_FACEBOOK_CLIENT_ID')
-        scope = 'email'
-        auth_url = 'https://www.facebook.com/v12.0/dialog/oauth'
+        client_secret = os.getenv('VITA_FACEBOOK_CLIENT_SECRET')
+        configured_redirect = os.getenv('VITA_FACEBOOK_REDIRECT_URI') or 'http://localhost:8000/auth/oauth/facebook/callback'
+        if not client_id or not client_secret:
+            missing = [n for n, v in (
+                ('VITA_FACEBOOK_CLIENT_ID', client_id),
+                ('VITA_FACEBOOK_CLIENT_SECRET', client_secret),
+            ) if not v]
+            raise HTTPException(status_code=500, detail=f'Missing required Facebook OAuth env vars: {", ".join(missing)}')
+
         params = {
             'client_id': client_id,
+            'redirect_uri': configured_redirect,
             'response_type': 'code',
-            'scope': scope,
-            'redirect_uri': redirect_uri,
+            'scope': 'email',
+            'state': state,
         }
+        auth_url = 'https://www.facebook.com/v12.0/dialog/oauth'
+
     elif provider == 'apple':
         client_id = os.getenv('VITA_APPLE_CLIENT_ID')
-        scope = 'name email'
-        auth_url = 'https://appleid.apple.com/auth/authorize'
+        configured_redirect = os.getenv('VITA_APPLE_REDIRECT_URI') or 'http://localhost:8000/auth/oauth/apple/callback'
+        if not client_id:
+            missing = [n for n, v in (
+                ('VITA_APPLE_CLIENT_ID', client_id),
+            ) if not v]
+            raise HTTPException(status_code=500, detail=f'Missing required Apple OAuth env vars: {", ".join(missing)}')
+
         params = {
             'client_id': client_id,
+            'redirect_uri': configured_redirect,
             'response_type': 'code',
-            'scope': scope,
-            'redirect_uri': redirect_uri,
+            'scope': 'name email',
             'response_mode': 'form_post',
+            'state': state,
         }
+        auth_url = 'https://appleid.apple.com/auth/authorize'
+
     else:
         raise HTTPException(status_code=400, detail='Unsupported OAuth provider')
 
-    if not client_id:
-        raise HTTPException(status_code=500, detail=f'Missing client id for {provider}. Set environment variable.')
-
-    # Build query string and redirect
-    from urllib.parse import urlencode
     url = auth_url + '?' + urlencode(params)
-    # Log the exact OAuth URL for debugging (do not log client_secret)
-    logger.info('OAuth %s login URL: %s', provider, url)
+    _oauth_log("oauth redirect", provider=provider, redirect_uri=params.get('redirect_uri'))
+    logger.info('OAuth %s login URL generated', provider)
     return RedirectResponse(url)
-
-
-@app.get('/auth/oauth/{provider}/callback', name='oauth_callback', include_in_schema=False)
-def oauth_callback(provider: str, request: Request, db: Session = Depends(get_db)):
+@app.api_route('/auth/oauth/{provider}/callback', methods=['GET','POST'], name='oauth_callback', include_in_schema=False)
+async def oauth_callback(provider: str, request: Request, db: Session = Depends(get_db)):
     """Handle provider callback: exchange code for token, fetch user info,
     create/login local user, and return a token to the frontend.
     """
     provider = provider.lower()
-    code = request.query_params.get('code')
+    _ensure_oauth_env_loaded()
+    # Accept code/state from query params (GET) or form (POST, e.g. Apple)
+    if request.method == 'POST':
+        form = await request.form()
+        code = form.get('code') or request.query_params.get('code')
+        state = form.get('state') or request.query_params.get('state')
+    else:
+        code = request.query_params.get('code')
+        state = request.query_params.get('state')
+
     if not code:
-        raise HTTPException(status_code=400, detail='Missing code from provider')
+        return _oauth_error_response('Missing code from provider', status_code=400)
+
+    # Validate CSRF state
+    state_entry = _pop_oauth_state(state, provider) if state else None
+    if not state or not state_entry:
+        return _oauth_error_response('Invalid or missing OAuth state parameter', status_code=400)
+
+    callback_frontend = _normalise_frontend_url((state_entry or {}).get("frontend_url")) or _frontend_target()
+
+    _oauth_log("oauth callback received", provider=provider, has_code=bool(code), has_state=bool(state))
 
     try:
         if provider == 'google':
             # Ensure required env vars are present and use configured redirect URI
-            client_id = os.getenv('VITA_GOOGLE_CLIENT_ID')
-            client_secret = os.getenv('VITA_GOOGLE_CLIENT_SECRET')
-            configured = os.getenv('VITA_GOOGLE_REDIRECT_URI')
-            if not client_id or not client_secret or not configured:
+            client_id = _google_client_id()
+            client_secret = _google_client_secret()
+            configured = _google_redirect_uri()
+            if _looks_like_placeholder(client_id) or _looks_like_placeholder(client_secret):
                 missing = [n for n, v in (
                     ('VITA_GOOGLE_CLIENT_ID', client_id),
                     ('VITA_GOOGLE_CLIENT_SECRET', client_secret),
-                    ('VITA_GOOGLE_REDIRECT_URI', configured),
-                ) if not v]
-                raise HTTPException(status_code=500, detail=f'Missing required Google OAuth env vars: {", ".join(missing)}')
+                ) if _looks_like_placeholder(v)]
+                return _oauth_error_response(
+                    f'Missing required Google OAuth env vars: {", ".join(missing)}',
+                    status_code=500,
+                    frontend=callback_frontend,
+                )
 
-            # Log if computed callback doesn't match configured, but use configured when exchanging token
-            computed = str(request.url_for('oauth_callback', provider='google'))
-            if computed != str(configured):
-                logger.warning('Google callback URL mismatch during token exchange: configured=%s computed=%s', configured, computed)
-
-            token_resp = requests.post(
-                'https://oauth2.googleapis.com/token',
-                data={
-                    'code': code,
-                    'client_id': client_id,
-                    'client_secret': client_secret,
-                    'redirect_uri': configured,
-                    'grant_type': 'authorization_code',
-                },
-                timeout=10,
-            )
-            token_json = token_resp.json()
-            access_token = token_json.get('access_token')
-            if not access_token:
-                raise HTTPException(status_code=400, detail='Failed to obtain access token from Google')
-            userinfo = requests.get('https://openidconnect.googleapis.com/v1/userinfo', headers={'Authorization': f'Bearer {access_token}'}, timeout=10).json()
-            email = userinfo.get('email')
-            name = userinfo.get('name') or userinfo.get('given_name') or (email.split('@')[0] if email else 'GoogleUser')
+            # Exchange code for token (async)
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                token_resp = await client.post(
+                    'https://oauth2.googleapis.com/token',
+                    data={
+                        'code': code,
+                        'client_id': client_id,
+                        'client_secret': client_secret,
+                        'redirect_uri': configured,
+                        'grant_type': 'authorization_code',
+                    },
+                )
+                token_resp.raise_for_status()
+                token_json = token_resp.json()
+                access_token = token_json.get('access_token')
+                if not access_token:
+                    logger.warning('Google token exchange failed: %s', token_json)
+                    return _oauth_error_response('Failed to obtain access token from Google', status_code=400, frontend=callback_frontend)
+                userinfo_resp = await client.get('https://www.googleapis.com/oauth2/v2/userinfo', headers={'Authorization': f'Bearer {access_token}'})
+                userinfo_resp.raise_for_status()
+                userinfo = userinfo_resp.json()
+                email = userinfo.get('email')
+                name = userinfo.get('name') or userinfo.get('given_name') or (email.split('@')[0] if email else 'GoogleUser')
+                picture = userinfo.get('picture')
+                _oauth_log(
+                    "google userinfo received",
+                    provider=provider,
+                    email_present=bool(email),
+                    name_present=bool(name),
+                    picture_present=bool(picture),
+                )
 
         elif provider == 'facebook':
-            token_resp = requests.get(
-                'https://graph.facebook.com/v12.0/oauth/access_token',
-                params={
-                    'client_id': os.getenv('VITA_FACEBOOK_CLIENT_ID'),
-                    'client_secret': os.getenv('VITA_FACEBOOK_CLIENT_SECRET'),
-                    'redirect_uri': request.url_for('oauth_callback', provider='facebook'),
+            fb_client_id = os.getenv('VITA_FACEBOOK_CLIENT_ID')
+            fb_client_secret = os.getenv('VITA_FACEBOOK_CLIENT_SECRET')
+            fb_redirect = os.getenv('VITA_FACEBOOK_REDIRECT_URI') or 'http://localhost:8000/auth/oauth/facebook/callback'
+            if not fb_client_id or not fb_client_secret:
+                missing = [n for n, v in (
+                    ('VITA_FACEBOOK_CLIENT_ID', fb_client_id),
+                    ('VITA_FACEBOOK_CLIENT_SECRET', fb_client_secret),
+                ) if not v]
+                raise HTTPException(status_code=500, detail=f'Missing required Facebook OAuth env vars: {", ".join(missing)}')
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                token_resp = await client.get('https://graph.facebook.com/v12.0/oauth/access_token', params={
+                    'client_id': fb_client_id,
+                    'client_secret': fb_client_secret,
+                    'redirect_uri': fb_redirect,
                     'code': code,
-                },
-                timeout=10,
-            )
-            token_json = token_resp.json()
-            access_token = token_json.get('access_token')
-            if not access_token:
-                raise HTTPException(status_code=400, detail='Failed to obtain access token from Facebook')
-            userinfo = requests.get('https://graph.facebook.com/me', params={'access_token': access_token, 'fields': 'id,name,email'}, timeout=10).json()
-            email = userinfo.get('email')
-            name = userinfo.get('name') or (email.split('@')[0] if email else 'FacebookUser')
+                })
+                token_resp.raise_for_status()
+                token_json = token_resp.json()
+                access_token = token_json.get('access_token')
+                if not access_token:
+                    logger.warning('Facebook token exchange failed: %s', token_json)
+                    return _oauth_error_response('Failed to obtain access token from Facebook', status_code=400)
+                userinfo_resp = await client.get('https://graph.facebook.com/me', params={'access_token': access_token, 'fields': 'id,name,email'})
+                userinfo_resp.raise_for_status()
+                userinfo = userinfo_resp.json()
+                email = userinfo.get('email')
+                name = userinfo.get('name') or (email.split('@')[0] if email else 'FacebookUser')
+                _oauth_log("facebook userinfo received", provider=provider, email_present=bool(email), name_present=bool(name))
 
         elif provider == 'apple':
-            # Apple uses a POST form response for code exchange; client secret must be a signed JWT
             client_id = os.getenv('VITA_APPLE_CLIENT_ID')
             team_id = os.getenv('VITA_APPLE_TEAM_ID')
             key_id = os.getenv('VITA_APPLE_KEY_ID')
-            private_key = os.getenv('VITA_APPLE_PRIVATE_KEY')  # PEM encoded private key
-            if not (client_id and team_id and key_id and private_key):
-                raise HTTPException(status_code=500, detail='Missing Apple OAuth credentials (VITA_APPLE_*)')
+            private_key = os.getenv('VITA_APPLE_PRIVATE_KEY')
+            configured_redirect = os.getenv('VITA_APPLE_REDIRECT_URI') or 'http://localhost:8000/auth/oauth/apple/callback'
+            if not (client_id and team_id and key_id and private_key and configured_redirect):
+                missing = [n for n, v in (
+                    ('VITA_APPLE_CLIENT_ID', client_id),
+                    ('VITA_APPLE_TEAM_ID', team_id),
+                    ('VITA_APPLE_KEY_ID', key_id),
+                    ('VITA_APPLE_PRIVATE_KEY', private_key),
+                ) if not v]
+                raise HTTPException(status_code=500, detail=f'Missing Apple OAuth env vars: {", ".join(missing)}')
 
             now = int(datetime.utcnow().timestamp())
             client_secret = jose_jwt.encode(
@@ -581,57 +800,90 @@ def oauth_callback(provider: str, request: Request, db: Session = Depends(get_db
                 headers={'kid': key_id},
             )
 
-            token_resp = requests.post(
-                'https://appleid.apple.com/auth/token',
-                data={
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                token_resp = await client.post('https://appleid.apple.com/auth/token', data={
                     'client_id': client_id,
                     'client_secret': client_secret,
                     'code': code,
                     'grant_type': 'authorization_code',
-                    'redirect_uri': request.url_for('oauth_callback', provider='apple'),
-                },
-                timeout=10,
-            )
-            token_json = token_resp.json()
-            access_token = token_json.get('access_token')
-            id_token = token_json.get('id_token')
-            # id_token is a JWT containing the user's email and (optionally) name
-            if id_token:
-                try:
-                    claims = jose_jwt.decode(id_token, options={"verify_signature": False})
-                    email = claims.get('email')
-                    name = claims.get('name') or (email.split('@')[0] if email else 'AppleUser')
-                except Exception:
+                    'redirect_uri': configured_redirect,
+                })
+                token_resp.raise_for_status()
+                token_json = token_resp.json()
+                access_token = token_json.get('access_token')
+                id_token = token_json.get('id_token')
+                if id_token:
+                    try:
+                        claims = jose_jwt.decode(id_token, options={"verify_signature": False})
+                        email = claims.get('email')
+                        name = claims.get('name') or (email.split('@')[0] if email else 'AppleUser')
+                    except Exception:
+                        email = None
+                        name = 'AppleUser'
+                else:
                     email = None
                     name = 'AppleUser'
-            else:
-                email = None
-                name = 'AppleUser'
+                _oauth_log("apple token processed", provider=provider, email_present=bool(email), has_id_token=bool(id_token))
 
         else:
             raise HTTPException(status_code=400, detail='Unsupported OAuth provider')
 
         if not email:
             # Email is required by the application to create a local user
-            raise HTTPException(status_code=400, detail='OAuth provider did not return an email address')
+            return _oauth_error_response('OAuth provider did not return an email address', status_code=400, frontend=callback_frontend)
 
         # Create or find user
         user = _get_or_create_user_by_email(db, email=email, name=name)
         token = create_access_token({"sub": user.email})
+        _oauth_log("oauth local auth complete", provider=provider, user_id=user.id, email=user.email)
 
         # Redirect to frontend or return HTML that stores token in localStorage
-        frontend = _frontend_target()
+        frontend = callback_frontend
         if frontend:
             dest = frontend.rstrip('/') + f'/?token={token}'
             return RedirectResponse(dest)
 
         return _make_html_token_response(token)
 
-    except HTTPException:
-        raise
+    except HTTPException as exc:
+        return _oauth_error_response(str(exc.detail), status_code=exc.status_code, frontend=callback_frontend)
+    except httpx.HTTPStatusError as exc:
+        logger.warning('OAuth %s HTTP error: %s', provider, exc)
+        return _oauth_error_response(f'OAuth HTTP error from {provider}', status_code=400, frontend=callback_frontend)
     except Exception as exc:
         logger.exception('OAuth callback handling failed: %s', exc)
-        raise HTTPException(status_code=500, detail='OAuth processing failed')
+        return _oauth_error_response('OAuth processing failed', status_code=500, frontend=callback_frontend)
+
+
+@app.get('/auth/config', tags=['Auth'])
+def auth_config():
+    """Return non-sensitive auth provider configuration status for diagnostics.
+
+    Does not return secrets. Shows whether required env vars are present and
+    the configured redirect URIs.
+    """
+    _ensure_oauth_env_loaded()
+    google_configured = (
+        not _looks_like_placeholder(_google_client_id())
+        and not _looks_like_placeholder(_google_client_secret())
+    )
+    cfg = {
+        'google_configured': google_configured,
+        'google': {
+            'configured': google_configured,
+            'redirect_uri': _google_redirect_uri(),
+        },
+        'facebook': {
+            'configured': all([os.getenv('VITA_FACEBOOK_CLIENT_ID'), os.getenv('VITA_FACEBOOK_CLIENT_SECRET')]),
+            'redirect_uri': os.getenv('VITA_FACEBOOK_REDIRECT_URI') or 'http://localhost:8000/auth/oauth/facebook/callback',
+        },
+        'apple': {
+            'configured': all([os.getenv('VITA_APPLE_CLIENT_ID'), os.getenv('VITA_APPLE_TEAM_ID'), os.getenv('VITA_APPLE_KEY_ID'), os.getenv('VITA_APPLE_PRIVATE_KEY')]),
+            'redirect_uri': os.getenv('VITA_APPLE_REDIRECT_URI') or 'http://localhost:8000/auth/oauth/apple/callback',
+        },
+        'frontend_url': _frontend_target(),
+    }
+    return cfg
 
 
 @app.get("/health", tags=["General"])
@@ -698,8 +950,8 @@ def list_models():
 
 # ── Face ──────────────────────────────────────────────────────────────────
 
-@app.post("/predict/face", tags=["Prediction"])
-async def predict_face(file: UploadFile = File(...)):
+async def _predict_face_from_upload(file: UploadFile) -> JSONResponse:
+    """Shared heavy video-processing path for face scan endpoints."""
     """Upload a short (20-30s) face video for comprehensive health screening.
 
     Returns heart rate estimate, behavioral features (blink rate, eye
@@ -720,14 +972,151 @@ async def predict_face(file: UploadFile = File(...)):
     if err:
         raise HTTPException(status_code=400, detail=err)
 
+    print(f"Video received: {file.filename}")
+
     ext = Path(file.filename or "").suffix.lower() or ".mp4"
     path = _save_upload(file, ext)
     try:
         result = analyze_face_video(path)
+        print(f"Result: {result}")
     finally:
         _cleanup(path)
 
-    return JSONResponse(content=result)
+    # Keep full rich payload and add stable aliases for video clients.
+    response_payload = dict(result)
+    response_payload.setdefault("bpm", result.get("heart_rate"))
+    response_payload.setdefault("stress", result.get("stress", result.get("risk")))
+    response_payload.setdefault(
+        "confidence", result.get("confidence", result.get("hr_confidence", 0.0))
+    )
+    response_payload.setdefault(
+        "quality",
+        result.get("scan_quality", result.get("signal_strength", 0.0)),
+    )
+    return JSONResponse(content=response_payload)
+
+
+@app.post("/predict/face", tags=["Prediction"])
+async def predict_face(file: UploadFile = File(...)):
+    """Backward-compatible face video endpoint."""
+    return await _predict_face_from_upload(file)
+
+
+@app.post("/predict/video", tags=["Prediction"])
+async def predict_video(file: UploadFile = File(...)):
+    """Primary video-first face scan endpoint for stable record-then-process flow."""
+    return await _predict_face_from_upload(file)
+
+
+async def _run_face_live_job(job_id: str, payload: dict) -> None:
+    """Run heavy live-signal analysis in background without blocking API thread."""
+    t_total_start = time.perf_counter()
+    try:
+        logger.info(
+            "[FaceLiveJob] started job_id=%s signal_len=%s duration_sec=%.2f sampling_hz=%.3f",
+            job_id,
+            len(payload.get("signal") or []),
+            float(payload.get("duration_sec") or 0.0),
+            float(payload.get("sampling_hz") or 0.0),
+        )
+
+        t_analysis_start = time.perf_counter()
+        result = await asyncio.to_thread(
+            analyze_live_face_signal,
+            signal=payload.get("signal") or [],
+            duration_sec=float(payload.get("duration_sec") or 0.0),
+            sampling_hz=float(payload.get("sampling_hz") or 0.0),
+            brightness_mean=payload.get("brightness_mean"),
+            frames_seen=payload.get("frames_seen"),
+            frames_processed=payload.get("frames_processed"),
+            frames_skipped=payload.get("frames_skipped"),
+        )
+        t_analysis = time.perf_counter() - t_analysis_start
+
+        total_elapsed = time.perf_counter() - t_total_start
+        async with _face_live_jobs_lock:
+            job = _face_live_jobs.get(job_id)
+            if job is not None:
+                job["status"] = "done"
+                job["result"] = result
+                job["error"] = None
+                job["analysis_sec"] = round(float(t_analysis), 4)
+                job["processing_sec"] = round(float(total_elapsed), 4)
+                job["updated_at"] = datetime.utcnow().isoformat()
+
+        logger.info(
+            "[FaceLiveJob] completed job_id=%s bpm=%s analysis_sec=%.4f total_sec=%.4f",
+            job_id,
+            result.get("heart_rate"),
+            float(t_analysis),
+            float(total_elapsed),
+        )
+    except Exception as exc:
+        total_elapsed = time.perf_counter() - t_total_start
+        async with _face_live_jobs_lock:
+            job = _face_live_jobs.get(job_id)
+            if job is not None:
+                job["status"] = "failed"
+                job["error"] = str(exc)
+                job["result"] = None
+                job["processing_sec"] = round(float(total_elapsed), 4)
+                job["updated_at"] = datetime.utcnow().isoformat()
+        logger.exception("[FaceLiveJob] failed job_id=%s after %.4fs: %s", job_id, total_elapsed, exc)
+
+
+@app.post("/predict/face-live", tags=["Prediction"])
+async def predict_face_live(body: FaceLiveSignalRequest, background_tasks: BackgroundTasks):
+    """Submit live face signal for background processing and return a job id."""
+    signal_len = len(body.signal)
+    logger.info("[FaceLive] received signal length: %s", signal_len)
+
+    if signal_len < 8:
+        raise HTTPException(status_code=400, detail="Signal is too short for live analysis")
+
+    job_id = uuid.uuid4().hex
+    now_iso = datetime.utcnow().isoformat()
+    payload = body.model_dump()
+
+    async with _face_live_jobs_lock:
+        _face_live_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "processing",
+            "result": None,
+            "error": None,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "analysis_sec": None,
+            "processing_sec": None,
+            "signal_len": signal_len,
+        }
+
+    logger.info("[FaceLive] job created job_id=%s", job_id)
+    background_tasks.add_task(_run_face_live_job, job_id, payload)
+    return JSONResponse(content={"job_id": job_id, "status": "processing"})
+
+
+@app.get("/predict/face-live/job-status/{job_id}", tags=["Prediction"])
+async def predict_face_live_job_status(job_id: str):
+    """Poll status for a previously submitted live face processing job."""
+    async with _face_live_jobs_lock:
+        job = _face_live_jobs.get(job_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="Live face job not found")
+
+    payload = {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+        "processing_sec": job["processing_sec"],
+        "analysis_sec": job["analysis_sec"],
+    }
+    if job["status"] == "done":
+        payload["result"] = job["result"]
+    elif job["status"] == "failed":
+        payload["error"] = job["error"] or "Live face processing failed"
+    return JSONResponse(content=payload)
 
 
 # ── Audio ─────────────────────────────────────────────────────────────────
@@ -1196,6 +1585,56 @@ def get_current_profile(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user
+
+
+@app.put("/auth/me", tags=["Auth"], response_model=UserResponse)
+def update_current_profile(
+    body: UpdateProfileRequest,
+    current_email: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update authenticated user's profile fields supported by current schema."""
+    user = db.query(User).filter(User.email == current_email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    new_name = body.name.strip()
+    if len(new_name) < 2:
+        raise HTTPException(status_code=400, detail="Name must be at least 2 characters")
+
+    user.name = new_name
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.post("/auth/change-password", tags=["Auth"])
+def change_password(
+    body: ChangePasswordRequest,
+    current_email: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Change password for authenticated user with current-password verification."""
+    user = db.query(User).filter(User.email == current_email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not verify_password(body.current_password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    if body.new_password != body.confirm_password:
+        raise HTTPException(status_code=400, detail="New password and confirm password do not match")
+
+    if body.current_password == body.new_password:
+        raise HTTPException(status_code=400, detail="New password must be different from current password")
+
+    valid, message = validate_password(body.new_password)
+    if not valid:
+        raise HTTPException(status_code=400, detail=message)
+
+    user.password_hash = hash_password(body.new_password)
+    db.commit()
+    return {"detail": "Password updated successfully"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -1,9 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:url_launcher/url_launcher.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
 import '../services/api_service.dart';
 import '../models/health_data.dart';
-import 'home_screen.dart';
 import 'signup_screen.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -32,27 +29,6 @@ class _LoginScreenState extends State<LoginScreen> {
   @override
   void initState() {
     super.initState();
-    // If OAuth redirected back with a token in the query (web), apply it.
-    if (kIsWeb) {
-      final token = Uri.base.queryParameters['token'];
-      if (token != null && token.isNotEmpty) {
-        ApiService.setToken(token);
-        // Fetch profile and navigate to home
-        ApiService.getProfile().then((profile) {
-          if (!mounted) return;
-          final user = profile;
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(
-              builder: (_) => HomeScreen(
-                userId: user['id'] as int? ?? 0,
-                userName: user['name'] as String? ?? 'User',
-              ),
-            ),
-          );
-        }).catchError((_) {});
-      }
-    }
   }
 
   Future<void> _login() async {
@@ -68,15 +44,15 @@ class _LoginScreenState extends State<LoginScreen> {
       final user =
           (resp['user'] as Map<String, dynamic>?) ?? resp;
       HealthData.clear();
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(
-          builder: (_) => HomeScreen(
-            userId: user['id'] as int? ?? 0,
-            userName: user['name'] as String? ?? 'User',
-          ),
-        ),
-      );
+          Navigator.pushNamedAndRemoveUntil(
+            context,
+            '/home',
+            (route) => false,
+            arguments: {
+              'userId': user['id'] as int? ?? 0,
+              'userName': user['name'] as String? ?? 'User',
+            },
+          );
     } on ApiException catch (e) {
       setState(() => _errorMessage = ApiException.parseMessage(e));
     } catch (_) {
@@ -89,22 +65,25 @@ class _LoginScreenState extends State<LoginScreen> {
 
   void _continueAsGuest() {
     HealthData.clear();
-    Navigator.pushReplacement(
+    Navigator.pushNamedAndRemoveUntil(
       context,
-      MaterialPageRoute(
-          builder: (_) => const HomeScreen(userId: 0, userName: 'Guest')),
+      '/home',
+      (route) => false,
+      arguments: const {'userId': 0, 'userName': 'Guest'},
     );
   }
 
-  Future<void> _openUrl(String url) async {
-    final uri = Uri.parse(url);
-    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not open $url')),
-        );
-      }
-    }
+  Future<void> _openSocialSignup(String source) async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SignupScreen(
+          signupSource: source,
+          requireName: false,
+          autoLoginAfterSignup: true,
+        ),
+      ),
+    );
   }
 
   Widget _socialButton(
@@ -177,21 +156,27 @@ class _LoginScreenState extends State<LoginScreen> {
                             const Color(0xFF1877F2),
                             Icons.facebook,
                             'Continue with Facebook',
-                            () => _openUrl('${ApiService.baseUrl}/auth/oauth/facebook/login'),
+                            () => _openSocialSignup('facebook'),
                           ),
                           const SizedBox(height: 10),
                           _socialButton(
                             Colors.red,
                             Icons.g_mobiledata,
                             'Continue with Google',
-                            () => _openUrl('${ApiService.baseUrl}/auth/oauth/google/login'),
+                            () => _openSocialSignup('google'),
                           ),
                           const SizedBox(height: 10),
                           _socialButton(
                             Colors.black,
                             Icons.apple,
                             'Continue with Apple',
-                            () => _openUrl('${ApiService.baseUrl}/auth/oauth/apple/login'),
+                            () => _openSocialSignup('apple'),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            'Create your Vita AI account using your Google/Facebook/Apple email (not official OAuth).',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
                           ),
                           const SizedBox(height: 20),
 

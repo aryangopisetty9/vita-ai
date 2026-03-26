@@ -58,8 +58,37 @@ class ResultScreen extends StatelessWidget {
     if (severity != null) points.add('Severity: $severity');
 
     // From face analysis
-    final hr = result['heart_rate'] ?? result['stable_heart_rate'];
-    if (hr != null) points.add('Heart Rate: $hr bpm');
+    final hrRaw = result['heart_rate'];
+    final hr = (hrRaw is num) ? hrRaw.toDouble() : double.tryParse(hrRaw?.toString() ?? '');
+    final resultAvailable = result['result_available'] == true;
+    final tier = (result['hr_result_tier']?.toString().toLowerCase() ?? '').trim();
+    final estimatedWeak = result['estimated_from_weak_signal'] == true;
+    final confidenceRaw = result['confidence'];
+    final hrConfidence = (confidenceRaw is num)
+        ? confidenceRaw.toDouble()
+        : double.tryParse(confidenceRaw?.toString() ?? '') ?? 0.0;
+    final hrReliability = (result['reliability']?.toString() ?? '').toLowerCase();
+    final fallbackValid = hr != null && hr > 0 && hrConfidence >= 0.2 && hrReliability != 'unreliable';
+    final isStrong = tier == 'strong_accept';
+    final isWeak = tier == 'weak_accept' || estimatedWeak;
+    final isReject = tier == 'reject' || tier == 'result_unavailable';
+    final legacyAvailable = isStrong || isWeak || (tier.isEmpty && fallbackValid);
+    final isValidHr = hr != null && hr > 0 && ((result.containsKey('result_available') ? resultAvailable : legacyAvailable)) && !isReject;
+    debugPrint('HR DEBUG => value=$hr confidence=$hrConfidence reliability=$hrReliability tier=$tier weak=$isWeak isValid=$isValidHr');
+    if (isValidHr) {
+      points.add('Heart Rate: ${hr.toStringAsFixed(0)} bpm');
+      if (isWeak) {
+        points.add('Estimated from weak signal');
+        points.add('Retake recommended');
+      }
+    } else {
+      points.add('No reliable pulse detected');
+      points.add('Try again with better lighting and less movement');
+    }
+
+    if (tier.isNotEmpty) {
+      points.add('Result Tier: ${isValidHr ? (isWeak ? 'RESULT_AVAILABLE (ESTIMATED)' : 'RESULT_AVAILABLE') : 'RESULT_UNAVAILABLE'}');
+    }
 
     final stability = result['stability']?.toString();
     if (stability != null) points.add('Stability: $stability');
@@ -128,7 +157,7 @@ class ResultScreen extends StatelessWidget {
     final recommendations = _buildRecommendations();
 
     return Scaffold(
-      backgroundColor: const Color(0xFFEDEFF3),
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       body: SafeArea(
         child: Column(
           children: [

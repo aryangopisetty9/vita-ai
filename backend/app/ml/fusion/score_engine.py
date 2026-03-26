@@ -44,7 +44,6 @@ from backend.app.core.config import (
     RPPG_NORMAL_LOW,
     SCORE_THRESHOLDS,
 )
-from backend.app.ml.fusion.fusion_model import predict_score as fusion_predict, get_fusion_status
 from backend.app.core.clinical_validation import (
     check_symptom_severity,
     check_cross_module_consistency,
@@ -304,13 +303,6 @@ def compute_vita_score(
         if hr_score is not None:
             scores["heart_score"] = hr_score
             weights["face"] = DEFAULT_WEIGHTS["heart"]
-            weights["face"] *= _module_reliability_factor(face_result)
-
-            # Quality-aware weight reduction: if face scan quality is low,
-            # reduce the face weight so noisy features don't dominate.
-            face_scan_quality = float(face_result.get("scan_quality") or 0.0)
-            if face_scan_quality < 0.5:
-                weights["face"] *= max(face_scan_quality / 0.5, 0.3)
 
             face_conf = face_result.get("confidence")
             confidences.append(float(face_conf) if face_conf is not None else 0.0)
@@ -326,7 +318,6 @@ def compute_vita_score(
         if br_score is not None:
             scores["breathing_score"] = br_score
             weights["breathing"] = DEFAULT_WEIGHTS["breathing"]
-            weights["breathing"] *= _module_reliability_factor(audio_result)
             audio_conf = audio_result.get("confidence")
             confidences.append(float(audio_conf) if audio_conf is not None else 0.0)
             used_modules.append("breathing")
@@ -338,7 +329,6 @@ def compute_vita_score(
         if sym_score is not None:
             scores["symptom_score"] = sym_score
             weights["symptom"] = DEFAULT_WEIGHTS["symptom"]
-            weights["symptom"] *= _module_reliability_factor(symptom_result)
             sym_conf = symptom_result.get("confidence")
             confidences.append(float(sym_conf) if sym_conf is not None else 0.0)
             used_modules.append("symptom")
@@ -359,41 +349,26 @@ def compute_vita_score(
             "final_weights": {},
         }
 
-    # --- Rebalance weights if some modules are missing ---
+    # --- Rebalance fixed explainable weights if modules are missing ---
+    # Base weights are always face=0.4, breathing=0.3, symptom=0.3.
+    # For missing modules, distribute their weight proportionally over
+    # the modules that produced usable scores.
     total_weight = sum(weights.values())
     normalised_weights = {k: v / total_weight for k, v in weights.items()}
 
-    # --- Weighted score (or trained fusion model if available) ---
+    # --- Deterministic weighted score (explainable by construction) ---
     weight_key_map = {
         "face": "heart_score",
         "breathing": "breathing_score",
         "symptom": "symptom_score",
     }
 
-    # Only call the ML fusion model when ALL three modules have real
-    # scores.  If any module is excluded (None normalisation), the
-    # model would receive a fake 50.0 placeholder — defeating the
-    # purpose of the fixes.  Fall back to weighted-sum in that case.
-    fusion_method = "weighted_sum"
-    fused = None
-
-    if not excluded_modules and len(scores) == 3:
-        fused = fusion_predict(
-            scores["heart_score"],
-            scores["breathing_score"],
-            scores["symptom_score"],
-            confidences,
-        )
-
-    if fused is not None:
-        vita_score = int(round(fused))
-        fusion_method = get_fusion_status().get("method", "trained_model")
-    else:
-        vita_score = 0.0
-        for wk, w in normalised_weights.items():
-            score_key = weight_key_map[wk]
-            vita_score += w * scores[score_key]
-        vita_score = int(round(np.clip(vita_score, 0, 100)))
+    vita_score = 0.0
+    for wk, w in normalised_weights.items():
+        score_key = weight_key_map[wk]
+        vita_score += w * scores[score_key]
+    vita_score = int(round(np.clip(vita_score, 0, 100)))
+    fusion_method = "weighted_sum_explainable"
 
     # --- Overall risk ---
     if vita_score >= SCORE_THRESHOLDS["low"]:

@@ -8,6 +8,30 @@ All tunable parameters, thresholds, and constants live here.
 import os
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency fallback
+    load_dotenv = None
+
+
+def _load_env_file_fallback(path: Path) -> None:
+    """Minimal .env parser used only when python-dotenv is unavailable."""
+    if not path.is_file():
+        return
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and not os.getenv(key):
+                os.environ[key] = value
+    except OSError:
+        # Ignore unreadable env files; runtime env vars still apply.
+        pass
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -16,13 +40,21 @@ BASE_DIR = Path(__file__).resolve().parents[3]
 SAMPLE_DATA_DIR = BASE_DIR / "backend" / "sample_data"
 TEMP_DIR = BASE_DIR / "temp"
 
+# Load environment variables from project-level .env files if present.
+if load_dotenv is not None:
+    load_dotenv(BASE_DIR / ".env")
+    load_dotenv(BASE_DIR / "backend" / ".env")
+else:
+    _load_env_file_fallback(BASE_DIR / ".env")
+    _load_env_file_fallback(BASE_DIR / "backend" / ".env")
+
 # ---------------------------------------------------------------------------
 # Face Module Defaults
 # ---------------------------------------------------------------------------
 FACE_MIN_FRAMES = 30          # minimum frames to attempt rPPG
 FACE_ROI_MARGIN = 0.15        # fractional margin around forehead ROI
 RPPG_LOW_HZ = 0.7             # ~42 BPM lower band-pass bound
-RPPG_HIGH_HZ = 3.5            # ~210 BPM upper band-pass bound
+RPPG_HIGH_HZ = 4.0            # ~240 BPM upper band-pass bound
 RPPG_NORMAL_LOW = 50          # normal adult resting HR low end
 RPPG_NORMAL_HIGH = 100        # normal adult resting HR high end
 MOTION_REJECT_THRESHOLD = 15.0  # px displacement to reject a frame

@@ -79,6 +79,8 @@ def _build_error_result(message: str, debug: Optional[Dict[str, Any]] = None) ->
         "message": message,
         "retake_required": True,
         "retake_reasons": [message],
+        "result_available": True,
+        "estimated_from_weak_signal": False,
         "debug": debug or {},
     }
 
@@ -89,6 +91,312 @@ def _smooth(signal: np.ndarray, window_len: int) -> np.ndarray:
         return signal
     kernel = np.ones(window_len) / window_len
     return np.convolve(signal, kernel, mode="same")
+
+
+def preprocess_audio(
+    y: np.ndarray,
+    sr: int,
+    target_sr: int = 16000,
+) -> tuple[np.ndarray, int, Dict[str, Any]]:
+    """Standardize waveform for robust downstream analysis.
+
+    Steps: mono conversion, fixed-rate resampling, peak normalization.
+    Breathing bandpass is applied on the RMS envelope in window analysis.
+    """
+    y_proc = y
+    original_sr = sr
+    if y_proc.ndim > 1:
+        y_proc = np.mean(y_proc, axis=1)
+
+    if sr != target_sr:
+        y_proc = librosa.resample(y_proc.astype(np.float32), orig_sr=sr, target_sr=target_sr)
+        sr = target_sr
+
+    y_proc = _normalize_amplitude(y_proc)
+    return y_proc.astype(np.float32), sr, {
+        "original_sr": int(original_sr),
+        "analysis_sr": int(sr),
+        "mono": True,
+        "normalized": True,
+        "bandpass_domain": "envelope",
+    }
+
+
+def compute_periodicity(
+    envelope: np.ndarray,
+    env_sr: float,
+    low_hz: float = 0.1,
+    high_hz: float = 0.7,
+) -> float:
+    """Return periodicity score in [0, 1] using FFT peak dominance."""
+    if len(envelope) < 8:
+        return 0.0
+    x = envelope - float(np.mean(envelope))
+    spec = np.abs(np.fft.rfft(x))
+    freqs = np.fft.rfftfreq(len(x), d=1.0 / max(env_sr, 1e-6))
+    mask = (freqs >= low_hz) & (freqs <= high_hz)
+    if not np.any(mask):
+        return 0.0
+    band = spec[mask]
+    peak = float(np.max(band))
+    if peak < 1e-8:
+        return 0.0
+    baseline = float(np.median(band) + 1e-8)
+    dominance = (peak - baseline) / (peak + baseline)
+    return float(np.clip(dominance, 0.0, 1.0))
+
+
+def compute_windows(
+    y: np.ndarray,
+    sr: int,
+    window_size_sec: float = 4.0,
+    overlap: float = 0.5,
+) -> Dict[str, Any]:
+    """Analyze sliding windows and keep per-window quality diagnostics."""
+    window_len = max(int(window_size_sec * sr), 1)
+    stride = max(int(window_len * (1.0 - overlap)), 1)
+    hop = max(int(sr * 0.02), 1)
+
+    window_stats: List[Dict[str, Any]] = []
+    valid_windows: List[Dict[str, Any]] = []
+
+    for idx, start in enumerate(range(0, max(len(y) - window_len + 1, 1), stride)):
+        end = min(start + window_len, len(y))
+        segment = y[start:end]
+        if len(segment) < max(int(1.5 * sr), 1):
+            continue
+
+        rms = librosa.feature.rms(y=segment, hop_length=hop)[0]
+        env_sr = float(sr / hop)
+        smooth_win = max(int(0.12 * env_sr), 2)
+        envelope = _smooth(rms, smooth_win)
+        envelope_bp = _bandpass_breathing(envelope, env_sr, low_hz=0.1, high_hz=0.7)
+
+        periodicity_score = compute_periodicity(envelope_bp, env_sr)
+        p95 = float(np.percentile(np.abs(envelope_bp), 95)) if len(envelope_bp) else 0.0
+        p5 = float(np.percentile(np.abs(envelope_bp), 5)) if len(envelope_bp) else 0.0
+        signal_strength = float(np.clip((p95 - p5) / (p95 + 1e-8), 0.0, 1.0))
+        noise_level = float(np.clip(np.mean(librosa.feature.spectral_flatness(y=segment)), 0.0, 1.0))
+
+        spec = np.abs(np.fft.rfft(envelope_bp - np.mean(envelope_bp))) if len(envelope_bp) else np.array([])
+        if spec.size > 2:
+            peak_mag = float(np.max(spec))
+            baseline_mag = float(np.median(spec) + 1e-8)
+            snr_estimate = float(np.clip(20.0 * np.log10((peak_mag + 1e-8) / baseline_mag), -20.0, 30.0))
+        else:
+            snr_estimate = -20.0
+
+        breathing_rate, cycle_count, win_quality, _ = _estimate_breathing_rate(segment, sr)
+        is_valid = (
+            6.0 <= breathing_rate <= 60.0
+            and signal_strength >= 0.12
+            and periodicity_score >= 0.10
+            and cycle_count >= 2
+        )
+
+        win = {
+            "window_index": idx,
+            "start_sec": round(start / sr, 2),
+            "end_sec": round(end / sr, 2),
+            "breathing_rate": round(float(breathing_rate), 2) if breathing_rate > 0 else None,
+            "signal_strength": round(signal_strength, 4),
+            "periodicity_score": round(periodicity_score, 4),
+            "noise_level": round(noise_level, 4),
+            "snr_estimate": round(snr_estimate, 3),
+            "cycle_count": int(cycle_count),
+            "window_quality": round(float(win_quality), 4),
+            "is_valid": bool(is_valid),
+        }
+        window_stats.append(win)
+        if is_valid:
+            valid_windows.append(win)
+
+    return {
+        "window_size_sec": window_size_sec,
+        "overlap": overlap,
+        "window_stats": window_stats,
+        "valid_windows": valid_windows,
+    }
+
+
+def aggregate_windows(
+    valid_windows: List[Dict[str, Any]],
+    fallback_rate: float = 0.0,
+) -> Dict[str, Any]:
+    """Cluster valid window rates and return consensus statistics."""
+    rates = [float(w["breathing_rate"]) for w in valid_windows if w.get("breathing_rate") is not None]
+    if not rates:
+        return {
+            "median_rate": round(float(fallback_rate), 1) if fallback_rate > 0 else 0.0,
+            "std_dev": 0.0,
+            "dominant_cluster_ratio": 0.0,
+            "periodicity_score": 0.0,
+            "signal_strength": 0.0,
+            "noise_level": 1.0,
+            "snr_estimate": -20.0,
+            "consistency": 0.0,
+        }
+
+    clusters: List[List[Dict[str, Any]]] = []
+    for w in valid_windows:
+        r = w.get("breathing_rate")
+        if r is None:
+            continue
+        placed = False
+        for c in clusters:
+            c_mean = float(np.mean([float(x["breathing_rate"]) for x in c]))
+            if abs(float(r) - c_mean) <= 3.0:
+                c.append(w)
+                placed = True
+                break
+        if not placed:
+            clusters.append([w])
+
+    dominant = max(clusters, key=len) if clusters else []
+    dominant_rates = [float(w["breathing_rate"]) for w in dominant if w.get("breathing_rate") is not None]
+    median_rate = float(np.median(dominant_rates)) if dominant_rates else float(np.median(rates))
+    std_dev = float(np.std(dominant_rates)) if len(dominant_rates) >= 2 else 0.0
+    dominant_cluster_ratio = float(len(dominant_rates) / max(len(rates), 1))
+    periodicity_score = float(np.mean([float(w["periodicity_score"]) for w in dominant])) if dominant else 0.0
+    signal_strength = float(np.mean([float(w["signal_strength"]) for w in dominant])) if dominant else 0.0
+    noise_level = float(np.mean([float(w["noise_level"]) for w in valid_windows])) if valid_windows else 1.0
+    snr_estimate = float(np.mean([float(w["snr_estimate"]) for w in dominant])) if dominant else -20.0
+    consistency = float(np.clip(1.0 - (std_dev / 8.0), 0.0, 1.0))
+
+    return {
+        "median_rate": round(median_rate, 1) if median_rate > 0 else 0.0,
+        "std_dev": round(std_dev, 4),
+        "dominant_cluster_ratio": round(dominant_cluster_ratio, 4),
+        "periodicity_score": round(periodicity_score, 4),
+        "signal_strength": round(signal_strength, 4),
+        "noise_level": round(noise_level, 4),
+        "snr_estimate": round(snr_estimate, 3),
+        "consistency": round(consistency, 4),
+    }
+
+
+def compute_confidence(
+    aggregate: Dict[str, Any],
+    valid_window_count: int,
+    speech_detected: bool,
+) -> Dict[str, Any]:
+    """Compute confidence with explicit caps for weak/noisy/speech-heavy signals."""
+    periodicity = float(aggregate.get("periodicity_score", 0.0))
+    periodicity_score = periodicity
+    signal_strength = float(aggregate.get("signal_strength", 0.0))
+    consistency = float(aggregate.get("consistency", 0.0))
+    dominant_ratio = float(aggregate.get("dominant_cluster_ratio", 0.0))
+    noise_level = float(aggregate.get("noise_level", 1.0))
+    snr_estimate = float(aggregate.get("snr_estimate", -20.0))
+    snr_norm = float(np.clip((snr_estimate + 10.0) / 20.0, 0.0, 1.0))
+
+    base = (
+        0.28 * periodicity
+        + 0.24 * signal_strength
+        + 0.20 * consistency
+        + 0.20 * dominant_ratio
+        + 0.08 * snr_norm
+    )
+    noise_penalty = float(np.clip(1.0 - 0.8 * noise_level, 0.45, 1.0))
+    confidence = float(np.clip(base * noise_penalty, 0.0, 1.0))
+    caps_applied: List[str] = []
+
+    speech_warning = False
+    speech_ignored_due_to_periodicity = False
+    if speech_detected:
+        if periodicity_score < 0.2:
+            confidence *= 0.8
+            speech_warning = True
+            caps_applied.append("speech_penalty_x0.8")
+        else:
+            speech_ignored_due_to_periodicity = True
+            caps_applied.append("speech_ignored_due_to_periodicity")
+
+    if periodicity <= 1e-6:
+        confidence = min(confidence, 0.50)
+        caps_applied.append("periodicity_zero_cap_0.50")
+
+    if valid_window_count <= 0:
+        confidence = min(confidence, 0.40)
+        caps_applied.append("no_valid_windows_cap_0.40")
+
+    return {
+        "confidence": round(float(np.clip(confidence, 0.0, 1.0)), 2),
+        "caps_applied": caps_applied,
+        "speech_warning": speech_warning,
+        "speech_ignored_due_to_periodicity": speech_ignored_due_to_periodicity,
+    }
+
+
+def decision_layer(
+    aggregate: Dict[str, Any],
+    valid_window_count: int,
+    confidence: float,
+    speech_detected: bool,
+    has_rate: bool,
+) -> Dict[str, Any]:
+    """Map evidence to reliability and weak-signal state without blocking output."""
+    periodicity = float(aggregate.get("periodicity_score", 0.0))
+    periodicity_score = periodicity
+    signal_strength = float(aggregate.get("signal_strength", 0.0))
+    dominant_ratio = float(aggregate.get("dominant_cluster_ratio", 0.0))
+    std_dev = float(aggregate.get("std_dev", 0.0))
+    reliability_std_threshold = 3.0
+
+    if periodicity_score >= 0.25:
+        strong_periodic_signal = True
+    else:
+        strong_periodic_signal = False
+
+    # Speech is only invalidating when periodic structure is also weak.
+    speech_low_structure = bool(speech_detected and periodicity_score < 0.2)
+
+    audio_signal_invalid = (
+        periodicity < 0.10
+        and signal_strength < 0.15
+        and valid_window_count < 3
+    )
+
+    # Periodicity priority: strong periodic rhythm overrides speech-based invalidation.
+    periodicity_override = bool(periodicity_score >= 0.20)
+    if strong_periodic_signal or periodicity_override:
+        audio_signal_invalid = False
+    elif speech_low_structure and has_rate:
+        audio_signal_invalid = True
+
+    if not has_rate:
+        reliability = "unreliable"
+    elif audio_signal_invalid:
+        reliability = "low"
+    elif periodicity_score > 0.3 and dominant_ratio > 0.5 and std_dev < reliability_std_threshold:
+        reliability = "high"
+    elif periodicity_score > 0.2:
+        reliability = "medium"
+    else:
+        reliability = "low"
+
+    estimated_from_weak_signal = bool(
+        has_rate and (audio_signal_invalid or valid_window_count < 3 or dominant_ratio < 0.5)
+    )
+
+    out_conf = float(confidence)
+    caps_applied: List[str] = []
+    if audio_signal_invalid and has_rate:
+        out_conf = min(out_conf, 0.45)
+        caps_applied.append("invalid_signal_cap_0.45")
+
+    return {
+        "result_available": True,
+        "audio_signal_invalid": bool(audio_signal_invalid),
+        "estimated_from_weak_signal": estimated_from_weak_signal,
+        "reliability": reliability,
+        "confidence": round(float(np.clip(out_conf, 0.0, 1.0)), 2),
+        "speech_detected": bool(speech_detected),
+        "speech_low_structure": speech_low_structure,
+        "periodicity_override": periodicity_override,
+        "strong_periodic_signal": strong_periodic_signal,
+        "caps_applied": caps_applied,
+    }
 
 
 # ── Audio preprocessing helpers ──────────────────────────────────────────
@@ -1017,7 +1325,7 @@ def analyze_audio(audio_path: str) -> Dict[str, Any]:
              "rejection_type": "narrow_band_noise"},
         )
 
-    y = _normalize_amplitude(y)
+    y, sr, preprocess_debug = preprocess_audio(y, sr, target_sr=16000)
     y = _spectral_noise_reduce(y, sr)
 
     # Check for excessive speech content (talking ≠ breathing)
@@ -1026,8 +1334,16 @@ def analyze_audio(audio_path: str) -> Dict[str, Any]:
     # Feature extraction
     features = _extract_features(y, sr)
 
-    # Breathing rate estimation
+    # Breathing rate estimation (legacy core + windowed consensus layer)
     breathing_rate, cycle_count, quality, est_debug = _estimate_breathing_rate(y, sr)
+
+    window_ctx = compute_windows(y, sr, window_size_sec=4.0, overlap=0.5)
+    valid_windows = window_ctx.get("valid_windows", [])
+    aggregate_ctx = aggregate_windows(valid_windows, fallback_rate=breathing_rate)
+
+    if aggregate_ctx.get("median_rate", 0.0) > 0 and len(valid_windows) >= 1:
+        breathing_rate = float(aggregate_ctx["median_rate"])
+    quality = float(np.clip(0.55 * quality + 0.45 * aggregate_ctx.get("consistency", 0.0), 0.0, 1.0))
 
     risk, message = _classify_breathing(breathing_rate)
 
@@ -1073,6 +1389,24 @@ def analyze_audio(audio_path: str) -> Dict[str, Any]:
     else:
         confidence = float(np.clip(confidence, 0.0, 0.68))
     confidence = round(float(confidence), 2)
+
+    # Face-style decision layer for audio trust calibration.
+    speech_detected = bool(sr_ratio > 0.5)
+    confidence_ctx = compute_confidence(
+        aggregate_ctx,
+        valid_window_count=len(valid_windows),
+        speech_detected=speech_detected,
+    )
+    confidence = round(float(np.clip(0.40 * confidence + 0.60 * confidence_ctx["confidence"], 0.0, 1.0)), 2)
+    decision_ctx = decision_layer(
+        aggregate_ctx,
+        valid_window_count=len(valid_windows),
+        confidence=confidence,
+        speech_detected=speech_detected,
+        has_rate=bool(breathing_rate > 0),
+    )
+    confidence = float(decision_ctx["confidence"])
+    high_breathing_rate = bool(breathing_rate > 40.0)
 
     suppression_reason: Optional[str] = None
     warning: Optional[str] = None
@@ -1174,14 +1508,26 @@ def analyze_audio(audio_path: str) -> Dict[str, Any]:
         cycles=cycle_count,
         has_signal=has_signal,
     )
+    if has_signal and decision_ctx.get("reliability") in {"high", "medium", "low"}:
+        reliability = str(decision_ctx["reliability"])
 
     # Retake logic
     retake_required = False
     retake_reasons: List[str] = []
-    if sr_ratio > 0.5:
+    speech_low_structure = bool(decision_ctx.get("speech_low_structure", False))
+    periodicity_score = float(aggregate_ctx.get("periodicity_score", 0.0))
+    dominant_cluster_ratio = float(aggregate_ctx.get("dominant_cluster_ratio", 0.0))
+    valid_window_count = len(valid_windows)
+    show_speech_warning = bool(speech_detected and periodicity_score < 0.2)
+    speech_ignored_due_to_periodicity = bool(speech_detected and periodicity_score >= 0.2)
+    confidence_floor_applied = False
+    confidence_boost_applied = False
+
+    if show_speech_warning and breathing_rate > 0:
+        warning = "Speech detected. Accuracy may be reduced."
+    if speech_low_structure and breathing_rate > 0:
         retake_reasons.append(
-            "Recording contains mostly speech. Please breathe normally "
-            "without talking and re-record."
+            "Speech detected with weak periodic breathing structure. Please re-record for better accuracy."
         )
         retake_required = True
     if cycle_count < 3 and suppression_reason is None and not _recovery_succeeded:
@@ -1205,6 +1551,9 @@ def analyze_audio(audio_path: str) -> Dict[str, Any]:
     if reliability == "low" and (cycle_count < 3 or quality < 0.15):
         retake_required = True
         retake_reasons.append("Weak breathing signal detected — retake for a more accurate result.")
+    if decision_ctx.get("audio_signal_invalid") and breathing_rate > 0:
+        retake_required = True
+        retake_reasons.append("Weak periodic breathing signal — estimate retained with low reliability.")
     if suppression_reason:
         retake_required = True
         retake_reasons.append(suppression_reason)
@@ -1231,6 +1580,25 @@ def analyze_audio(audio_path: str) -> Dict[str, Any]:
         "recovery_success": _recovery_succeeded,
         "recovery": {k: v for k, v in _recovery_result.items() if k != "attempt_log"}
             if _recovery_result else None,
+        "periodicity_score": aggregate_ctx.get("periodicity_score", 0.0),
+        "valid_windows": len(valid_windows),
+        "window_stats": window_ctx.get("window_stats", []),
+        "dominant_cluster_ratio": aggregate_ctx.get("dominant_cluster_ratio", 0.0),
+        "std_dev": aggregate_ctx.get("std_dev", 0.0),
+        "audio_signal_invalid": decision_ctx.get("audio_signal_invalid", False),
+        "speech_detected": speech_detected,
+        "high_breathing_rate": high_breathing_rate,
+        "window_consensus_rate": aggregate_ctx.get("median_rate", 0.0),
+        "window_snr_estimate": aggregate_ctx.get("snr_estimate", -20.0),
+        "analysis_windows": {
+            "window_size_sec": window_ctx.get("window_size_sec", 4.0),
+            "overlap": window_ctx.get("overlap", 0.5),
+        },
+        "confidence_caps_applied": [
+            *confidence_ctx.get("caps_applied", []),
+            *decision_ctx.get("caps_applied", []),
+        ],
+        "preprocess": preprocess_debug,
         # Multi-method estimation debug (all requested fields)
         "fft_rate":                    est_debug.get("fft_rate"),
         "autocorr_rate":               est_debug.get("autocorr_rate"),
@@ -1258,6 +1626,13 @@ def analyze_audio(audio_path: str) -> Dict[str, Any]:
         librosa_confidence=confidence,
         librosa_breathing_rate=breathing_rate if breathing_rate > 0 else None,
     )
+    model_labels = [str(lbl).lower() for lbl in model_result.get("labels", [])]
+    model_speech_detected = any(
+        token in label
+        for label in model_labels
+        for token in ("speech", "conversation", "narration", "talk", "whisper", "inside, small room")
+    )
+    speech_detected = bool(speech_detected or model_speech_detected)
     debug_info["audio_model"] = {
         "model_used": comparison.get("model_name", "none"),
         "source": comparison.get("source", "librosa_pipeline"),
@@ -1276,6 +1651,61 @@ def analyze_audio(audio_path: str) -> Dict[str, Any]:
         if comparison.get("model_labels"):
             message += " Audio model detected: " + ", ".join(comparison["model_labels"]) + "."
 
+    # Final speech gating must use the merged speech signal (envelope + model labels).
+    show_speech_warning = bool(speech_detected and periodicity_score < 0.2)
+    speech_ignored_due_to_periodicity = bool(speech_detected and periodicity_score >= 0.2)
+
+    # Enforce non-inflated confidence caps in the final output layer.
+    if show_speech_warning and breathing_rate > 0:
+        confidence = round(float(np.clip(confidence * 0.8, 0.0, 1.0)), 2)
+        if warning is None:
+            warning = "Speech detected. Accuracy may be reduced."
+    if high_breathing_rate and breathing_rate > 0:
+        confidence = round(float(np.clip(confidence * 0.85, 0.0, 1.0)), 2)
+    if periodicity_score <= 1e-6 and breathing_rate > 0:
+        confidence = min(float(confidence), 0.50)
+        reliability = "low"
+    if len(valid_windows) == 0 and breathing_rate > 0:
+        confidence = min(float(confidence), 0.40)
+    if decision_ctx.get("audio_signal_invalid") and breathing_rate > 0:
+        confidence = min(float(confidence), 0.45)
+    if decision_ctx.get("audio_signal_invalid") and breathing_rate > 0:
+        reliability = "low"
+
+    if periodicity_score > 0.25 and valid_window_count >= 5 and breathing_rate > 0:
+        prev_conf = float(confidence)
+        confidence = max(float(confidence), 0.65)
+        confidence_floor_applied = confidence > prev_conf
+
+    if periodicity_score > 0.4 and dominant_cluster_ratio > 0.6 and breathing_rate > 0:
+        prev_conf = float(confidence)
+        confidence = min(float(confidence) + 0.1, 0.9)
+        confidence_boost_applied = confidence > prev_conf
+
+    if periodicity_score <= 1e-6 and breathing_rate > 0:
+        confidence = min(float(confidence), 0.5)
+        reliability = "low"
+
+    confidence = round(float(np.clip(confidence, 0.0, 1.0)), 2)
+
+    debug_info["speech_detected"] = speech_detected
+    debug_info["audio_signal_invalid"] = bool(decision_ctx.get("audio_signal_invalid", False))
+    debug_info["high_breathing_rate"] = high_breathing_rate
+    debug_info["strong_periodic_signal"] = bool(decision_ctx.get("strong_periodic_signal", False))
+    debug_info["speech_ignored_due_to_periodicity"] = speech_ignored_due_to_periodicity
+    debug_info["confidence_floor_applied"] = confidence_floor_applied
+    debug_info["show_speech_warning"] = show_speech_warning
+    if speech_low_structure:
+        debug_info["rejection_reason"] = "speech_without_periodicity"
+    debug_info["confidence_caps_applied"] = [
+        *debug_info.get("confidence_caps_applied", []),
+        *( ["speech_penalty_x0.8"] if show_speech_warning and breathing_rate > 0 else [] ),
+        *( ["speech_ignored_due_to_periodicity"] if speech_ignored_due_to_periodicity and breathing_rate > 0 else [] ),
+        *( ["high_rate_penalty_x0.85"] if high_breathing_rate and breathing_rate > 0 else [] ),
+        *( ["confidence_floor_0.65"] if confidence_floor_applied and breathing_rate > 0 else [] ),
+        *( ["strong_periodic_boost_0.1"] if confidence_boost_applied and breathing_rate > 0 else [] ),
+    ]
+
     return {
         "module_name": "audio_module",
         "metric_name": "breathing_rate",
@@ -1292,5 +1722,7 @@ def analyze_audio(audio_path: str) -> Dict[str, Any]:
         "message": message,
         "retake_required": retake_required,
         "retake_reasons": retake_reasons,
+        "result_available": True,
+        "estimated_from_weak_signal": bool(decision_ctx.get("estimated_from_weak_signal", False)),
         "debug": debug_info,
     }

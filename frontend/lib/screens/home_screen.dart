@@ -6,11 +6,11 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import '../models/health_data.dart';
 import '../services/api_service.dart';
-import 'face_scan_screen.dart';
-import 'voice_screen.dart';
 import 'symptom_screen.dart';
 import 'scan_history_screen.dart';
 import 'sos_screen.dart';
+import 'settings_screen.dart';
+import '../widgets/vita_score_breakdown_dialog.dart';
 
 class HomeScreen extends StatefulWidget {
   final int userId;
@@ -36,19 +36,25 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _loadLatestScore() async {
     if (widget.userId == 0) return;
     try {
+      // Rehydrate from backend from a clean module state to avoid stale inputs.
+      HealthData.clearModuleResults();
+      HealthData.score = null;
+      HealthData.riskLevel = 'unknown';
+      HealthData.latestFusionResult = null;
       final scans = await ApiService.getScanHistory(widget.userId);
       if (scans.isNotEmpty) {
         // Walk through scans (newest first) and populate per-module raw results
         // from the stored result_json so fusion can be recomputed server-side.
         final seen = <String>{};
         for (final s in scans) {
-          final scan = s as Map<String, dynamic>;
+          if (s is! Map<String, dynamic>) continue;
+          final scan = s;
           final scanType = scan['scan_type']?.toString() ?? '';
           final resultJson = scan['result_json']?.toString() ?? '';
+          final module = HealthData.normalizeModuleLabel(scanType);
 
-          if (!seen.contains(scanType) && resultJson.isNotEmpty) {
-            seen.add(scanType);
-            final module = scanType == 'audio' ? 'breathing' : scanType;
+          if (!seen.contains(module) && resultJson.isNotEmpty) {
+            seen.add(module);
             try {
               final parsed = jsonDecode(resultJson) as Map<String, dynamic>;
               HealthData.setModuleResult(module, parsed);
@@ -70,27 +76,48 @@ class _HomeScreenState extends State<HomeScreen> {
             final vita = fusionResult['vita_health_score'] as int?;
             final overall =
                 fusionResult['overall_risk']?.toString() ?? 'unknown';
+            HealthData.latestFusionResult = Map<String, dynamic>.from(fusionResult);
             if (vita != null && vita > 0) {
               HealthData.score = vita;
               HealthData.riskLevel = overall;
             }
           } catch (_) {
-            // Fusion endpoint unavailable — leave existing score as-is.
+            // Fusion unavailable — fallback to latest persisted scan score.
+            final latest = scans.whereType<Map<String, dynamic>>().cast<Map<String, dynamic>>().firstWhere(
+                  (s) => s['vita_score'] != null,
+                  orElse: () => <String, dynamic>{},
+                );
+            final latestScore = latest['vita_score'] as int?;
+            if (latestScore != null && latestScore > 0) {
+              HealthData.score = latestScore;
+              HealthData.riskLevel = latest['risk_level']?.toString() ?? 'unknown';
+            }
+          }
+        } else {
+          // No usable module payloads to recompute fusion; fallback to latest saved score.
+          final latest = scans.whereType<Map<String, dynamic>>().cast<Map<String, dynamic>>().firstWhere(
+                (s) => s['vita_score'] != null,
+                orElse: () => <String, dynamic>{},
+              );
+          final latestScore = latest['vita_score'] as int?;
+          if (latestScore != null && latestScore > 0) {
+            HealthData.score = latestScore;
+            HealthData.riskLevel = latest['risk_level']?.toString() ?? 'unknown';
           }
         }
 
         // Re-populate dashboard history from backend scans.
-        HealthData.history = scans.take(10).map((s) {
-          final scan = s as Map<String, dynamic>;
+        HealthData.history = scans.whereType<Map<String, dynamic>>().map((scan) {
           final vitaScore = scan['vita_score'];
           final riskLevel = scan['risk_level']?.toString() ?? '';
           final scanType = scan['scan_type']?.toString() ?? '';
           final createdAt = scan['created_at']?.toString() ?? '';
+          final rawResultJson = scan['result_json']?.toString() ?? '';
           DateTime? dt;
           try {
             dt = DateTime.parse(createdAt);
           } catch (_) {}
-          final module = scanType == 'audio' ? 'breathing' : scanType;
+          final module = HealthData.normalizeModuleLabel(scanType);
           final label = module == 'face'
               ? 'Face scan'
               : module == 'breathing'
@@ -98,36 +125,76 @@ class _HomeScreenState extends State<HomeScreen> {
                   : module == 'symptom'
                       ? 'Symptom check'
                       : module;
+
+          String extra = vitaScore == null ? 'score unavailable' : label;
+          if (module == 'face' && rawResultJson.isNotEmpty) {
+            try {
+              final parsed = jsonDecode(rawResultJson) as Map<String, dynamic>;
+              final resultAvailable = parsed['result_available'] == true;
+              final estimatedWeak = parsed['estimated_from_weak_signal'] == true;
+              final tier = (parsed['hr_result_tier']?.toString().toLowerCase() ?? '').trim();
+              final hrRaw = parsed['heart_rate'];
+              final hr = hrRaw is num ? hrRaw.toDouble() : double.tryParse(hrRaw?.toString() ?? '');
+              final legacyStrong = tier == 'strong_accept';
+              final legacyWeak = tier == 'weak_accept';
+              final legacyReject = tier == 'reject' || tier == 'result_unavailable';
+              final available = parsed.containsKey('result_available')
+                  ? resultAvailable
+                  : (legacyStrong || legacyWeak);
+              if (available && (estimatedWeak || legacyWeak) && hr != null && hr > 0) {
+                extra = 'Estimated HR ${hr.toStringAsFixed(0)} bpm';
+              } else if (available && hr != null && hr > 0) {
+                extra = 'HR ${hr.toStringAsFixed(0)} bpm';
+              } else if (!available || legacyReject) {
+                extra = 'No reliable pulse detected';
+              }
+            } catch (_) {}
+          }
+
           return <String, String>{
+            'scan_id': scan['id']?.toString() ?? '',
             'score': vitaScore != null ? '$vitaScore%' : '—',
             'fusion': '',
             'module': module,
             'risk': riskLevel,
+            'created_at': createdAt,
             'time': dt != null
                 ? '${dt.hour}:${dt.minute.toString().padLeft(2, '0')}'
                 : '',
             'date': dt != null
                 ? '${dt.day}-${dt.month}-${dt.year}'
                 : '',
-            'extra': vitaScore == null ? 'score unavailable' : label,
+            'extra': extra,
           };
         }).toList();
       } else {
         // No scans remain — clear stale score so the gauge shows "no data".
+        HealthData.clearModuleResults();
         HealthData.score = null;
         HealthData.riskLevel = 'unknown';
+        HealthData.latestFusionResult = null;
         HealthData.history = [];
       }
       if (mounted) setState(() {});
     } catch (_) {}
   }
 
+  Future<void> _openScoreBreakdown() async {
+    await VitaScoreBreakdownDialog.show(
+      context,
+      score: HealthData.score,
+      riskLevel: HealthData.riskLevel,
+      fusionResult: HealthData.latestFusionResult,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final int? score = HealthData.score;
+    final latestHistory = HealthData.latestDashboardHistory();
 
     return Scaffold(
-      backgroundColor: const Color(0xFFEDEFF3),
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       body: SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(18),
@@ -175,67 +242,71 @@ class _HomeScreenState extends State<HomeScreen> {
               _buildCard(
                 title: "Vita Health Score",
                 icon: Icons.speed,
-                child: Container(
-                  height: 120,
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(18),
-                    gradient: const LinearGradient(
-                      colors: [Color(0xFFE9EDF5), Color(0xFFDDE3F0)],
+                child: InkWell(
+                  onTap: _openScoreBreakdown,
+                  borderRadius: BorderRadius.circular(18),
+                  child: Container(
+                    height: 120,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(18),
+                      gradient: const LinearGradient(
+                        colors: [Color(0xFFE9EDF5), Color(0xFFDDE3F0)],
+                      ),
                     ),
-                  ),
-                  child: Center(
-                    child: score != null
-                        ? Stack(
-                            alignment: Alignment.center,
-                            children: [
-                              SizedBox(
-                                height: 90,
-                                width: 90,
-                                child: CircularProgressIndicator(
-                                  value: score / 100,
-                                  strokeWidth: 12,
-                                  color: _scoreColor(score),
-                                  backgroundColor: Colors.grey.shade300,
+                    child: Center(
+                      child: score != null
+                          ? Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                SizedBox(
+                                  height: 90,
+                                  width: 90,
+                                  child: CircularProgressIndicator(
+                                    value: score / 100,
+                                    strokeWidth: 12,
+                                    color: _scoreColor(score),
+                                    backgroundColor: Colors.grey.shade300,
+                                  ),
                                 ),
-                              ),
-                              Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text('$score%',
-                                      style: TextStyle(
-                                          fontSize: 22,
-                                          fontWeight: FontWeight.bold,
-                                          color: _scoreColor(score))),
-                                  if (HealthData.riskLevel != 'unknown')
-                                    Text(
-                                      HealthData.riskLevel.toUpperCase(),
-                                      style: TextStyle(
-                                          fontSize: 10,
-                                          color: _scoreColor(score)),
-                                    ),
-                                ],
-                              ),
-                            ],
-                          )
-                        : Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: const [
-                              Icon(Icons.health_and_safety_outlined,
-                                  size: 40, color: Colors.grey),
-                              SizedBox(height: 8),
-                              Text(
-                                'No complete score yet',
-                                style: TextStyle(
-                                    color: Colors.grey, fontSize: 14),
-                              ),
-                              SizedBox(height: 2),
-                              Text(
-                                'Complete a scan to see your score',
-                                style: TextStyle(
-                                    color: Colors.grey, fontSize: 11),
-                              ),
-                            ],
-                          ),
+                                Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text('$score%',
+                                        style: TextStyle(
+                                            fontSize: 22,
+                                            fontWeight: FontWeight.bold,
+                                            color: _scoreColor(score))),
+                                    if (HealthData.riskLevel != 'unknown')
+                                      Text(
+                                        HealthData.riskLevel.toUpperCase(),
+                                        style: TextStyle(
+                                            fontSize: 10,
+                                            color: _scoreColor(score)),
+                                      ),
+                                  ],
+                                ),
+                              ],
+                            )
+                          : Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: const [
+                                Icon(Icons.health_and_safety_outlined,
+                                    size: 40, color: Colors.grey),
+                                SizedBox(height: 8),
+                                Text(
+                                  'No complete score yet',
+                                  style: TextStyle(
+                                      color: Colors.grey, fontSize: 14),
+                                ),
+                                SizedBox(height: 2),
+                                Text(
+                                  'Complete a scan to see your score',
+                                  style: TextStyle(
+                                      color: Colors.grey, fontSize: 11),
+                                ),
+                              ],
+                            ),
+                    ),
                   ),
                 ),
               ),
@@ -283,7 +354,32 @@ class _HomeScreenState extends State<HomeScreen> {
                       if (mounted) setState(() {});
                     }),
                     _actionButton(
-                        Icons.settings, "Settings", Colors.black54, () {}),
+                        Icons.settings, "Settings", Colors.black54, () async {
+                      final messenger = ScaffoldMessenger.of(context);
+                      debugPrint('Settings button pressed — opening SettingsScreen');
+                      try {
+                        await Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => SettingsScreen(
+                              userId: widget.userId,
+                              userName: widget.userName,
+                            ),
+                          ),
+                        );
+                        debugPrint('Returned from SettingsScreen');
+                      } catch (e, st) {
+                        debugPrint('Navigation to SettingsScreen failed: $e\n$st');
+                        if (mounted) {
+                          messenger.showSnackBar(
+                            SnackBar(content: Text('Could not open Settings: $e')),
+                          );
+                        }
+                      }
+
+                      // reload in case profile changes affected display
+                      if (mounted) setState(() {});
+                    }),
                   ],
                 ),
               ),
@@ -299,23 +395,25 @@ class _HomeScreenState extends State<HomeScreen> {
                   children: [
                     _actionButton(Icons.camera_alt, "Face", Colors.blue,
                         () async {
-                      await Navigator.push(
+                      await Navigator.pushNamed(
                         context,
-                        MaterialPageRoute(
-                          builder: (_) =>
-                              FaceScanScreen(userId: widget.userId),
-                        ),
+                        '/face',
+                        arguments: {
+                          'userId': widget.userId,
+                          'userName': widget.userName,
+                        },
                       );
                       _loadLatestScore();
                       if (mounted) setState(() {});
                     }),
                     _actionButton(Icons.mic, "Voice", Colors.green, () async {
-                      await Navigator.push(
+                      await Navigator.pushNamed(
                         context,
-                        MaterialPageRoute(
-                          builder: (_) =>
-                              VoiceScreen(userId: widget.userId),
-                        ),
+                        '/voice',
+                        arguments: {
+                          'userId': widget.userId,
+                          'userName': widget.userName,
+                        },
                       );
                       _loadLatestScore();
                       if (mounted) setState(() {});
@@ -345,9 +443,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 icon: Icons.history,
                 child: Column(
                   children: [
-                    if (HealthData.history.isEmpty)
+                    if (latestHistory.isEmpty)
                       const Text("No history yet"),
-                    ...HealthData.history.take(5).map((h) => Padding(
+                    ...latestHistory.map((h) => Padding(
                           padding: const EdgeInsets.symmetric(vertical: 4),
                           child: Row(
                             mainAxisAlignment:
@@ -420,7 +518,14 @@ class _HomeScreenState extends State<HomeScreen> {
     return Column(
       children: [
         GestureDetector(
-          onTap: onTap,
+          onTap: () {
+            try {
+              debugPrint('QuickAction tapped: $label');
+              onTap();
+            } catch (e, st) {
+              debugPrint('QuickAction handler error for $label: $e\n$st');
+            }
+          },
           child: Container(
             width: 62,
             height: 62,

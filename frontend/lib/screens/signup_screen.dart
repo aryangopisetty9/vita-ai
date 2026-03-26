@@ -1,8 +1,19 @@
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
+import '../models/health_data.dart';
+import 'home_screen.dart';
 
 class SignupScreen extends StatefulWidget {
-  const SignupScreen({super.key});
+  final String? signupSource;
+  final bool requireName;
+  final bool autoLoginAfterSignup;
+
+  const SignupScreen({
+    super.key,
+    this.signupSource,
+    this.requireName = true,
+    this.autoLoginAfterSignup = false,
+  });
 
   @override
   State<SignupScreen> createState() => _SignupScreenState();
@@ -19,6 +30,21 @@ class _SignupScreenState extends State<SignupScreen> {
   bool _obscurePass = true;
   bool _obscureConfirm = true;
   String? _errorMessage;
+
+  bool get _isSocialSignup => widget.signupSource != null;
+
+  String get _socialSourceLabel {
+    switch ((widget.signupSource ?? '').toLowerCase()) {
+      case 'google':
+        return 'Google';
+      case 'facebook':
+        return 'Facebook';
+      case 'apple':
+        return 'Apple';
+      default:
+        return 'Social';
+    }
+  }
 
   @override
   void dispose() {
@@ -62,11 +88,34 @@ class _SignupScreenState extends State<SignupScreen> {
 
     setState(() => _loading = true);
     try {
+      final displayName = widget.requireName
+          ? _nameCtrl.text.trim()
+          : '$_socialSourceLabel User';
+
       await ApiService.signup(
-        _nameCtrl.text.trim(),
+        displayName,
         _emailCtrl.text.trim(),
         _passCtrl.text,
       );
+
+      if (widget.autoLoginAfterSignup) {
+        final resp = await ApiService.login(_emailCtrl.text.trim(), _passCtrl.text);
+        if (!mounted) return;
+        final user = (resp['user'] as Map<String, dynamic>?) ?? resp;
+        HealthData.clear();
+        Navigator.pushAndRemoveUntil(
+          context,
+          MaterialPageRoute(
+            builder: (_) => HomeScreen(
+              userId: user['id'] as int? ?? 0,
+              userName: user['name'] as String? ?? 'User',
+            ),
+          ),
+          (route) => false,
+        );
+        return;
+      }
+
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -125,31 +174,38 @@ class _SignupScreenState extends State<SignupScreen> {
                             ],
                           ),
                           const SizedBox(height: 6),
-                          Text('Create your account',
-                              style: TextStyle(
-                                  color: Colors.grey.shade600, fontSize: 14)),
+                          Text(
+                            _isSocialSignup
+                                ? 'Create your Vita AI account using your $_socialSourceLabel email'
+                                : 'Create your account',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                                color: Colors.grey.shade600, fontSize: 14),
+                          ),
                           const SizedBox(height: 24),
 
                           // ── Full Name ────────────────────────────────
-                          TextFormField(
-                            controller: _nameCtrl,
-                            textCapitalization: TextCapitalization.words,
-                            decoration: const InputDecoration(
-                              labelText: 'Full Name',
-                              prefixIcon: Icon(Icons.person_outline),
-                              border: OutlineInputBorder(),
+                          if (widget.requireName) ...[
+                            TextFormField(
+                              controller: _nameCtrl,
+                              textCapitalization: TextCapitalization.words,
+                              decoration: const InputDecoration(
+                                labelText: 'Full Name',
+                                prefixIcon: Icon(Icons.person_outline),
+                                border: OutlineInputBorder(),
+                              ),
+                              validator: (v) {
+                                if (v == null || v.trim().isEmpty) {
+                                  return 'Name is required';
+                                }
+                                if (v.trim().length < 2) {
+                                  return 'Name must be at least 2 characters';
+                                }
+                                return null;
+                              },
                             ),
-                            validator: (v) {
-                              if (v == null || v.trim().isEmpty) {
-                                return 'Name is required';
-                              }
-                              if (v.trim().length < 2) {
-                                return 'Name must be at least 2 characters';
-                              }
-                              return null;
-                            },
-                          ),
-                          const SizedBox(height: 16),
+                            const SizedBox(height: 16),
+                          ],
 
                           // ── Email ────────────────────────────────────
                           TextFormField(
@@ -281,7 +337,7 @@ class _SignupScreenState extends State<SignupScreen> {
                                       child: CircularProgressIndicator(
                                           strokeWidth: 2,
                                           color: Colors.white))
-                                  : const Text('Create Account',
+                                  : Text(widget.autoLoginAfterSignup ? 'Create Account & Sign In' : 'Create Account',
                                       style: TextStyle(fontSize: 16)),
                             ),
                           ),

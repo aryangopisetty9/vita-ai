@@ -36,14 +36,15 @@ from backend.app.ml.face.vision_utils import (
     RIGHT_CHEEK,
     extract_cheek_roi,
     extract_forehead_roi,
-    mean_green_from_roi,
-    mean_rgb_from_roi,
+    mean_green_from_roi_tiled,
+    mean_rgb_from_roi_tiled,
     build_skin_mask,
     overexposure_ratio,
     compute_roi_quality_metrics,
 )
 from backend.app.utils.signal_processing import (
     chrom_project,
+    compute_hr_timeseries,
     compute_periodicity,
     compute_signal_strength,
     estimate_bpm,
@@ -59,6 +60,11 @@ from backend.app.utils.signal_processing import (
     detrend_signal,
     temporal_normalization,
     bandpass_fft,
+    robust_hr_consensus,
+)
+from backend.app.ml.face.signal_quality_model import (
+    evaluate_signal_quality,
+    extract_quality_features,
 )
 
 
@@ -70,6 +76,12 @@ _MIN_ROI_QUALITY = 0.08
 
 # Maximum allowed overexposure ratio on an ROI to accept it
 _MAX_ROI_OVEREXPOSURE = 0.40
+_CANDIDATE_MIN_SIGNAL_STRENGTH = 0.03
+_CANDIDATE_MIN_PERIODICITY = 0.03
+_CANDIDATE_MIN_VALID_WINDOWS = 1
+_CANDIDATE_MAX_WINDOW_STD_NO_CONSENSUS = 22.0
+_MIN_EFFECTIVE_FPS = 12.0
+_TARGET_RESAMPLE_FPS = 15.0
 
 
 def _apply_skin_mask(roi_crop: np.ndarray, mask_crop: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
@@ -78,6 +90,14 @@ def _apply_skin_mask(roi_crop: np.ndarray, mask_crop: Optional[np.ndarray] = Non
     Returns the combined mask or None if no skin pixels survive.
     """
     skin = build_skin_mask(roi_crop)
+    # Reject very dark shadows and clipped highlights inside ROI.
+    luma = (
+        0.114 * roi_crop[:, :, 0].astype(np.float64)
+        + 0.587 * roi_crop[:, :, 1].astype(np.float64)
+        + 0.299 * roi_crop[:, :, 2].astype(np.float64)
+    )
+    tone_ok = ((luma >= 22.0) & (luma <= 245.0)).astype(np.uint8) * 255
+    skin = skin & tone_ok
     if mask_crop is not None:
         combined = skin & mask_crop
     else:
@@ -106,7 +126,7 @@ def extract_frame_roi_signals(
     fh_roi = extract_forehead_roi(frame_bgr, lm_list, h, w)
     if fh_roi is not None and fh_roi.size > 0:
         skin_m = _apply_skin_mask(fh_roi)
-        signals["forehead"] = mean_green_from_roi(fh_roi, skin_m)
+        signals["forehead"] = mean_green_from_roi_tiled(fh_roi, skin_m)
     else:
         signals["forehead"] = None
 
@@ -115,7 +135,7 @@ def extract_frame_roi_signals(
     if lc is not None:
         roi_crop, mask_crop = lc
         combined = _apply_skin_mask(roi_crop, mask_crop)
-        signals["left_cheek"] = mean_green_from_roi(roi_crop, combined)
+        signals["left_cheek"] = mean_green_from_roi_tiled(roi_crop, combined)
     else:
         signals["left_cheek"] = None
 
@@ -124,7 +144,7 @@ def extract_frame_roi_signals(
     if rc is not None:
         roi_crop, mask_crop = rc
         combined = _apply_skin_mask(roi_crop, mask_crop)
-        signals["right_cheek"] = mean_green_from_roi(roi_crop, combined)
+        signals["right_cheek"] = mean_green_from_roi_tiled(roi_crop, combined)
     else:
         signals["right_cheek"] = None
 
@@ -151,7 +171,7 @@ def extract_frame_roi_rgb(
     fh_roi = extract_forehead_roi(frame_bgr, lm_list, h, w)
     if fh_roi is not None and fh_roi.size > 0:
         skin_m = _apply_skin_mask(fh_roi)
-        signals["forehead"] = mean_rgb_from_roi(fh_roi, skin_m)
+        signals["forehead"] = mean_rgb_from_roi_tiled(fh_roi, skin_m)
     else:
         signals["forehead"] = None
 
@@ -160,7 +180,7 @@ def extract_frame_roi_rgb(
     if lc is not None:
         roi_crop, mask_crop = lc
         combined = _apply_skin_mask(roi_crop, mask_crop)
-        signals["left_cheek"] = mean_rgb_from_roi(roi_crop, combined)
+        signals["left_cheek"] = mean_rgb_from_roi_tiled(roi_crop, combined)
     else:
         signals["left_cheek"] = None
 
@@ -169,7 +189,7 @@ def extract_frame_roi_rgb(
     if rc is not None:
         roi_crop, mask_crop = rc
         combined = _apply_skin_mask(roi_crop, mask_crop)
-        signals["right_cheek"] = mean_rgb_from_roi(roi_crop, combined)
+        signals["right_cheek"] = mean_rgb_from_roi_tiled(roi_crop, combined)
     else:
         signals["right_cheek"] = None
 
@@ -251,12 +271,139 @@ def _compute_roi_signal_quality(
     return float(np.clip(quality, 0.0, 1.0)), color_var, illum_stab
 
 
+def _resample_uniform_signal(
+    values: np.ndarray,
+    timestamps: Optional[np.ndarray],
+    fallback_fps: float,
+) -> Tuple[np.ndarray, float, bool]:
+    """Resample non-uniformly sampled values onto a uniform time grid."""
+    if timestamps is None or len(values) < 8:
+        return values, fallback_fps, False
+
+    n = min(len(values), len(timestamps))
+    if n < 8:
+        return values, fallback_fps, False
+
+    v = values[:n].astype(np.float64)
+    t = timestamps[:n].astype(np.float64)
+    t = t - t[0]
+
+    # Keep strictly increasing timestamps only.
+    keep = np.concatenate(([True], np.diff(t) > 1e-4))
+    t = t[keep]
+    v = v[keep]
+    if len(v) < 8:
+        return values, fallback_fps, False
+
+    dt = np.median(np.diff(t)) if len(t) >= 2 else 0.0
+    if dt <= 0:
+        return values, fallback_fps, False
+
+    est_fps = float(np.clip(1.0 / dt, 8.0, 120.0))
+    # Trigger resampling only if cadence drift is non-trivial.
+    if abs(est_fps - fallback_fps) / max(fallback_fps, 1e-6) < 0.05:
+        return v, fallback_fps, False
+
+    step = 1.0 / est_fps
+    uniform_t = np.arange(0.0, t[-1] + 1e-12, step, dtype=np.float64)
+    if len(uniform_t) < 8:
+        return v, fallback_fps, False
+    v_u = np.interp(uniform_t, t, v)
+    return v_u.astype(np.float64), est_fps, True
+
+
+def _resample_uniform_rgb(
+    rgb_arr: np.ndarray,
+    timestamps: Optional[np.ndarray],
+    fallback_fps: float,
+) -> Tuple[np.ndarray, float, bool]:
+    """Resample RGB traces onto a uniform time grid."""
+    if timestamps is None or len(rgb_arr) < 8:
+        return rgb_arr, fallback_fps, False
+
+    n = min(len(rgb_arr), len(timestamps))
+    if n < 8:
+        return rgb_arr, fallback_fps, False
+
+    rgb = rgb_arr[:n].astype(np.float64)
+    t = timestamps[:n].astype(np.float64)
+    t = t - t[0]
+
+    keep = np.concatenate(([True], np.diff(t) > 1e-4))
+    t = t[keep]
+    rgb = rgb[keep]
+    if len(rgb) < 8:
+        return rgb_arr, fallback_fps, False
+
+    dt = np.median(np.diff(t)) if len(t) >= 2 else 0.0
+    if dt <= 0:
+        return rgb_arr, fallback_fps, False
+
+    est_fps = float(np.clip(1.0 / dt, 8.0, 120.0))
+    if abs(est_fps - fallback_fps) / max(fallback_fps, 1e-6) < 0.05:
+        return rgb, fallback_fps, False
+
+    step = 1.0 / est_fps
+    uniform_t = np.arange(0.0, t[-1] + 1e-12, step, dtype=np.float64)
+    if len(uniform_t) < 8:
+        return rgb, fallback_fps, False
+
+    out = np.zeros((len(uniform_t), 3), dtype=np.float64)
+    for ch in range(3):
+        out[:, ch] = np.interp(uniform_t, t, rgb[:, ch])
+    return out, est_fps, True
+
+
+def _upsample_to_target_fps_signal(
+    values: np.ndarray,
+    current_fps: float,
+    target_fps: float,
+) -> Tuple[np.ndarray, float, bool]:
+    """Linearly upsample 1-D signal when effective FPS is too low."""
+    if len(values) < 8 or current_fps <= 0 or current_fps >= target_fps:
+        return values, current_fps, False
+    duration = float((len(values) - 1) / max(current_fps, 1e-6))
+    if duration <= 0:
+        return values, current_fps, False
+    src_t = np.arange(len(values), dtype=np.float64) / max(current_fps, 1e-6)
+    dst_t = np.arange(0.0, duration + 1e-12, 1.0 / target_fps, dtype=np.float64)
+    if len(dst_t) < 8:
+        return values, current_fps, False
+    out = np.interp(dst_t, src_t, values.astype(np.float64))
+    return out.astype(np.float64), target_fps, True
+
+
+def _upsample_to_target_fps_rgb(
+    rgb_arr: Optional[np.ndarray],
+    current_fps: float,
+    target_fps: float,
+) -> Tuple[Optional[np.ndarray], float, bool]:
+    """Linearly upsample RGB traces when effective FPS is too low."""
+    if rgb_arr is None or len(rgb_arr) < 8 or current_fps <= 0 or current_fps >= target_fps:
+        return rgb_arr, current_fps, False
+    duration = float((len(rgb_arr) - 1) / max(current_fps, 1e-6))
+    if duration <= 0:
+        return rgb_arr, current_fps, False
+    src_t = np.arange(len(rgb_arr), dtype=np.float64) / max(current_fps, 1e-6)
+    dst_t = np.arange(0.0, duration + 1e-12, 1.0 / target_fps, dtype=np.float64)
+    if len(dst_t) < 8:
+        return rgb_arr, current_fps, False
+    out = np.zeros((len(dst_t), 3), dtype=np.float64)
+    rgb = rgb_arr.astype(np.float64)
+    for ch in range(3):
+        out[:, ch] = np.interp(dst_t, src_t, rgb[:, ch])
+    return out, target_fps, True
+
+
 def _build_candidate_signal(
     method: str,
     green_signal: np.ndarray,
     rgb_arr: Optional[np.ndarray],
     fps: float,
-) -> Optional[np.ndarray]:
+    low_hz: float,
+    high_hz: float,
+    timestamps: Optional[np.ndarray] = None,
+) -> Tuple[Optional[np.ndarray], float, bool]:
     """Build a pulse signal for a given extraction method.
 
     Methods: 'green', 'pos', 'chrom', 'pca'.
@@ -265,42 +412,84 @@ def _build_candidate_signal(
     that already normalise internally (POS, CHROM, PCA/LGI) receive
     only the remaining steps to avoid double-normalization.
     """
+    green_sig, eff_fps, green_rs = _resample_uniform_signal(green_signal, timestamps, fps)
+    rgb_eff, rgb_fps, rgb_rs = _resample_uniform_rgb(rgb_arr, timestamps, fps) if rgb_arr is not None else (None, fps, False)
+
+    # Low-FPS protection: upsample to a safe analysis cadence for frequency estimation.
+    low_fps_resampled = False
+    if eff_fps < _MIN_EFFECTIVE_FPS:
+        green_sig, eff_fps, up_g = _upsample_to_target_fps_signal(green_sig, eff_fps, _TARGET_RESAMPLE_FPS)
+        low_fps_resampled = low_fps_resampled or up_g
+    if rgb_eff is not None and rgb_fps < _MIN_EFFECTIVE_FPS:
+        rgb_eff, rgb_fps, up_rgb = _upsample_to_target_fps_rgb(rgb_eff, rgb_fps, _TARGET_RESAMPLE_FPS)
+        low_fps_resampled = low_fps_resampled or up_rgb
+
     if method == "green":
-        sig = green_signal.copy()
+        sig = green_sig.copy()
         # Green needs full preprocessing: MA → detrend → temporal normalize → bandpass
-        ma_window = max(3, int(fps * 0.12))
+        ma_window = max(3, int(eff_fps * 0.12))
         sig = moving_average_smooth(sig.astype(np.float64), window=ma_window)
         sig = detrend_signal(sig)
-        sig = temporal_normalization(sig, window=max(int(fps * 2), 8))
-        sig = bandpass_fft(sig, fps, 0.7, 3.5)
-    elif method == "pos" and rgb_arr is not None and len(rgb_arr) >= 8:
-        sig = pos_project(rgb_arr, fps)
+        sig = temporal_normalization(sig, window=max(int(eff_fps * 2), 8))
+        sig = bandpass_fft(sig, eff_fps, low_hz, high_hz)
+    elif method == "pos" and rgb_eff is not None and len(rgb_eff) >= 8:
+        eff_fps = rgb_fps
+        sig = pos_project(rgb_eff, eff_fps)
         # POS applies per-window temporal normalization internally (overlap-add);
         # only detrend + bandpass here to avoid double normalization.
         if len(sig) < 8:
-            return None
+            return None, eff_fps, (green_rs or rgb_rs or low_fps_resampled)
         sig = detrend_signal(sig.astype(np.float64))
-        sig = bandpass_fft(sig, fps, 0.7, 3.5)
-    elif method == "chrom" and rgb_arr is not None and len(rgb_arr) >= 8:
-        sig = chrom_project(rgb_arr, fps)
+        sig = bandpass_fft(sig, eff_fps, low_hz, high_hz)
+    elif method == "chrom" and rgb_eff is not None and len(rgb_eff) >= 8:
+        eff_fps = rgb_fps
+        sig = chrom_project(rgb_eff, eff_fps)
         # CHROM applies temporal normalization + detrend internally;
         # only bandpass here to avoid triple normalization.
         if len(sig) < 8:
-            return None
-        sig = bandpass_fft(sig.astype(np.float64), fps, 0.7, 3.5)
-    elif method == "pca" and rgb_arr is not None and len(rgb_arr) >= 8:
-        sig = lgi_project(rgb_arr, fps)
+            return None, eff_fps, (green_rs or rgb_rs or low_fps_resampled)
+        sig = bandpass_fft(sig.astype(np.float64), eff_fps, low_hz, high_hz)
+    elif method == "pca" and rgb_eff is not None and len(rgb_eff) >= 8:
+        eff_fps = rgb_fps
+        sig = lgi_project(rgb_eff, eff_fps, low_hz=low_hz, high_hz=high_hz)
         # PCA/LGI applies full preprocessing internally (detrend + temporal norm + bandpass).
         if len(sig) < 8:
-            return None
+            return None, eff_fps, (green_rs or rgb_rs or low_fps_resampled)
+    elif method == "intensity" and rgb_eff is not None and len(rgb_eff) >= 8:
+        eff_fps = rgb_fps
+        intensity = np.mean(rgb_eff, axis=1)
+        sig = detrend_signal(intensity.astype(np.float64))
+        sig = temporal_normalization(sig, window=max(int(eff_fps * 2), 8))
+        sig = bandpass_fft(sig, eff_fps, low_hz, high_hz)
     else:
-        return None
+        return None, eff_fps, (green_rs or rgb_rs or low_fps_resampled)
     if len(sig) < 8:
-        return None
-    return sig
+        return None, eff_fps, (green_rs or rgb_rs or low_fps_resampled)
+    sig = _suppress_outlier_jumps(sig)
+    return sig, eff_fps, (green_rs or rgb_rs or low_fps_resampled)
 
 
-_EXTRACTION_METHODS = ("green", "pos", "chrom", "pca")
+def _suppress_outlier_jumps(signal: np.ndarray) -> np.ndarray:
+    """Suppress abrupt sample jumps that are unlikely to be physiological."""
+    if len(signal) < 8:
+        return signal
+    s = signal.astype(np.float64).copy()
+    d = np.diff(s)
+    if len(d) < 4:
+        return s
+    med = float(np.median(d))
+    mad = float(np.median(np.abs(d - med)))
+    if mad < 1e-9:
+        return s
+    thresh = 6.0 * mad
+    bad = np.where(np.abs(d - med) > thresh)[0] + 1
+    for idx in bad.tolist():
+        if 1 <= idx < len(s) - 1:
+            s[idx] = 0.5 * (s[idx - 1] + s[idx + 1])
+    return s
+
+
+_EXTRACTION_METHODS = ("green", "pos", "chrom", "pca", "intensity")
 
 
 def estimate_heart_rate_multi_roi(
@@ -312,6 +501,7 @@ def estimate_heart_rate_multi_roi(
     roi_rgb_traces: Optional[Dict[str, List[np.ndarray]]] = None,
     roi_overexposure: Optional[Dict[str, List[float]]] = None,
     roi_skin_coverage: Optional[Dict[str, float]] = None,
+    roi_timestamps: Optional[Dict[str, List[float]]] = None,
 ) -> Dict[str, Any]:
     """Full ROI × method competition engine.
 
@@ -327,6 +517,7 @@ def estimate_heart_rate_multi_roi(
     per_roi_signal_quality: Dict[str, float] = {}
     per_roi_color_var: Dict[str, float] = {}
     per_roi_illum_stab: Dict[str, float] = {}
+    per_roi_overexposure: Dict[str, float] = {}
     rois_dropped: List[str] = []
 
     for name, trace in roi_traces.items():
@@ -338,6 +529,7 @@ def estimate_heart_rate_multi_roi(
             oe_vals = roi_overexposure[name]
             if oe_vals:
                 oe_mean = float(np.mean(oe_vals))
+        per_roi_overexposure[name] = round(oe_mean, 4)
         skin_cov = 1.0
         if roi_skin_coverage and name in roi_skin_coverage:
             skin_cov = roi_skin_coverage[name]
@@ -383,8 +575,29 @@ def estimate_heart_rate_multi_roi(
 
     # ── Phase 2: build candidate signals (ROI × method) ─────────
     candidates: List[Dict[str, Any]] = []
+    candidate_rejections: List[Dict[str, Any]] = []
+
+    # Adaptive ROI weights from measurable quality evidence.
+    adaptive_roi_weights: Dict[str, float] = {}
+    for roi_name in roi_signals:
+        base = float(roi_weights.get(roi_name, 1.0))
+        roi_q = float(per_roi_signal_quality.get(roi_name, 0.0))
+        illum = float(per_roi_illum_stab.get(roi_name, 0.0))
+        oe = float(per_roi_overexposure.get(roi_name, 0.0))
+        oe_pen = float(np.clip(1.0 - oe / _MAX_ROI_OVEREXPOSURE, 0.0, 1.0))
+        adaptive_roi_weights[roi_name] = float(np.clip(base * (0.45 + 0.55 * roi_q) * (0.65 + 0.35 * illum) * (0.70 + 0.30 * oe_pen), 0.05, 3.0))
+
+    # Normalise ROI weights for transparent debug and stable scaling.
+    roi_w_sum = float(sum(adaptive_roi_weights.values()))
+    if roi_w_sum > 1e-9:
+        for k in list(adaptive_roi_weights.keys()):
+            adaptive_roi_weights[k] = round(adaptive_roi_weights[k] / roi_w_sum, 4)
+
     for roi_name in roi_signals:
         green_sig = roi_signals[roi_name]
+        trace_ts = None
+        if roi_timestamps and roi_name in roi_timestamps and len(roi_timestamps[roi_name]) >= 8:
+            trace_ts = np.array(roi_timestamps[roi_name], dtype=np.float64)
         rgb_arr = None
         if roi_rgb_traces and roi_name in roi_rgb_traces and len(roi_rgb_traces[roi_name]) >= 8:
             rgb_arr = np.array(roi_rgb_traces[roi_name], dtype=np.float64)
@@ -392,16 +605,76 @@ def estimate_heart_rate_multi_roi(
                 rgb_arr = None
 
         for method in _EXTRACTION_METHODS:
-            pulse = _build_candidate_signal(method, green_sig, rgb_arr, fps)
+            pulse, eff_fps, was_resampled = _build_candidate_signal(
+                method,
+                green_sig,
+                rgb_arr,
+                fps,
+                low_hz,
+                high_hz,
+                timestamps=trace_ts,
+            )
             if pulse is None:
                 continue
-            hr_est = spectral_hr_estimate(pulse, fps, low_hz, high_hz)
+            hr_est = spectral_hr_estimate(pulse, eff_fps, low_hz, high_hz)
             bpm_est = hr_est["bpm"]
             spec_q = hr_est["quality"]
             if bpm_est <= 0:
+                candidate_rejections.append({
+                    "roi": roi_name,
+                    "method": method,
+                    "reason": "invalid_bpm",
+                })
                 continue
-            ss = compute_signal_strength(pulse, fps, low_hz, high_hz)
+            ss = compute_signal_strength(pulse, eff_fps, low_hz, high_hz)
             roi_q = per_roi_signal_quality.get(roi_name, 0.0)
+
+            # Multi-window agreement per candidate.
+            ts = compute_hr_timeseries(
+                pulse.tolist(),
+                eff_fps,
+                window_sec=5.0,
+                stride_sec=0.5,
+                low_hz=low_hz,
+                high_hz=high_hz,
+                min_window_quality=0.06,
+            )
+            consensus = robust_hr_consensus(ts, periodicity=ss["periodicity"], min_windows=2)
+            valid_windows = int(consensus.get("valid_window_count", 0))
+            window_consistency = float(consensus.get("consensus_confidence", 0.0))
+            window_std = float(consensus.get("std_dev", 999.0))
+            has_consensus = bool(consensus.get("has_consensus", False))
+
+            # Pre-estimation gate: reject weak candidates early.
+            if (
+                ss["signal_strength"] < _CANDIDATE_MIN_SIGNAL_STRENGTH
+                or ss["periodicity"] < _CANDIDATE_MIN_PERIODICITY
+            ):
+                candidate_rejections.append({
+                    "roi": roi_name,
+                    "method": method,
+                    "reason": "weak_signal_pre_gate",
+                    "signal_strength": ss["signal_strength"],
+                    "periodicity": ss["periodicity"],
+                })
+                continue
+            if valid_windows < _CANDIDATE_MIN_VALID_WINDOWS:
+                candidate_rejections.append({
+                    "roi": roi_name,
+                    "method": method,
+                    "reason": "insufficient_windows",
+                    "valid_windows": valid_windows,
+                })
+                continue
+            if (not has_consensus) and window_std > _CANDIDATE_MAX_WINDOW_STD_NO_CONSENSUS:
+                candidate_rejections.append({
+                    "roi": roi_name,
+                    "method": method,
+                    "reason": "inconsistent_windows",
+                    "std_dev": window_std,
+                })
+                continue
+
             # Part 3: Peak dominance validation — reduce confidence for weak or
             # isolated peaks so they can't win the competition unfairly.
             dominance_penalty = 1.0
@@ -415,14 +688,29 @@ def estimate_heart_rate_multi_roi(
             # add secondary weight; tiny ROI preference (max 5 points)
             # prevents stacking multiplicative biases.
             illum_stab = per_roi_illum_stab.get(roi_name, 1.0)
-            base_w = roi_weights.get(roi_name, 1.0)  # 1.5 for forehead, 1.0 for cheeks
-            max_w = max(roi_weights.values()) if roi_weights else 1.5
-            roi_pref = float(np.clip((base_w - 1.0) / max(max_w - 1.0, 1e-6) * 0.05, 0.0, 0.05))
-            candidate_score = (
+            roi_w = float(adaptive_roi_weights.get(roi_name, 0.33))
+
+            # ML/rule quality gate uses measurable features only.
+            features = extract_quality_features(
+                pulse,
+                eff_fps,
+                low_hz,
+                high_hz,
+                motion_contamination=float(np.clip(1.0 - illum_stab, 0.0, 1.0)),
+                roi_stability=illum_stab,
+                brightness_quality=float(np.clip(roi_q, 0.0, 1.0)),
+                overexposure_ratio=float(per_roi_overexposure.get(roi_name, 0.0)),
+                window_consistency=window_consistency,
+                valid_window_ratio=float(np.clip(valid_windows / 8.0, 0.0, 1.0)),
+            )
+            quality_eval = evaluate_signal_quality(features)
+            quality_prob = float(quality_eval["good_signal_probability"])
+
+            evidence_score = (
                 0.65 * ss["signal_strength"]
                 + 0.25 * roi_q
                 + 0.05 * illum_stab
-                + roi_pref
+                + 0.05 * window_consistency
             )
             candidates.append({
                 "roi": roi_name,
@@ -448,9 +736,43 @@ def estimate_heart_rate_multi_roi(
                 "peak_snr": hr_est["peak_snr"],
                 "physiologically_valid": hr_est["physiologically_valid"],
                 "roi_quality": round(roi_q, 4),
-                "candidate_score": round(float(np.clip(candidate_score, 0.0, 1.0)), 4),
+                "window_consistency": round(window_consistency, 4),
+                "window_std_dev": round(window_std, 3),
+                "valid_windows": valid_windows,
+                "has_window_consensus": has_consensus,
+                "effective_fps": round(float(eff_fps), 3),
+                "resampled": bool(was_resampled),
+                "quality_probability": round(quality_prob, 4),
+                "quality_source": quality_eval.get("source", "rule_fallback"),
+                "quality_label": quality_eval.get("label", "bad_signal"),
+                "quality_features": {k: round(float(v), 4) for k, v in features.items()},
+                "evidence_score": round(float(np.clip(evidence_score, 0.0, 1.0)), 4),
+                "roi_weight": round(roi_w, 4),
                 "_pulse": pulse,  # internal, not serialised
             })
+
+    # Adaptive method-family weighting from measurable candidate evidence.
+    method_strength: Dict[str, float] = {m: 0.0 for m in _EXTRACTION_METHODS}
+    for c in candidates:
+        m = c["method"]
+        q = float(c.get("quality_probability", 0.0))
+        method_strength[m] = max(method_strength[m], float(c.get("evidence_score", 0.0)) * (0.55 + 0.45 * q))
+
+    method_total = float(sum(method_strength.values()))
+    if method_total > 1e-9:
+        method_weights = {m: round(method_strength[m] / method_total, 4) for m in method_strength}
+    else:
+        method_weights = {m: 0.0 for m in method_strength}
+
+    # Final candidate score combines evidence + ROI + method + quality probability.
+    for c in candidates:
+        roi_w = float(c.get("roi_weight", 0.33))
+        method_w = float(method_weights.get(c["method"], 0.0))
+        quality_prob = float(c.get("quality_probability", 0.0))
+        base = float(c.get("evidence_score", 0.0))
+        final_score = base * (0.65 + 0.35 * roi_w) * (0.70 + 0.30 * method_w) * (0.45 + 0.55 * quality_prob)
+        c["candidate_score"] = round(float(np.clip(final_score, 0.0, 1.0)), 4)
+        c["method_weight"] = round(method_w, 4)
 
     # ── Phase 3: select best candidate ───────────────────────────
     per_roi_bpm: Dict[str, float] = {}
@@ -517,7 +839,10 @@ def estimate_heart_rate_multi_roi(
             "roi_scores": per_roi_signal_quality,
             "roi_color_variance": per_roi_color_var,
             "roi_illumination_stability": per_roi_illum_stab,
+            "roi_adaptive_weights": adaptive_roi_weights,
             "method_scores": {},
+            "method_adaptive_weights": {m: 0.0 for m in _EXTRACTION_METHODS},
+            "candidate_rejections": candidate_rejections,
             # Part 5 debug fields (empty for fallback path)
             "harmonic_checked": False,
             "harmonic_corrected": False,
@@ -562,6 +887,14 @@ def estimate_heart_rate_multi_roi(
         sc = {k: v for k, v in c.items() if k != "_pulse"}
         serialisable.append(sc)
 
+    eff_fps_values = [float(c.get("effective_fps", fps)) for c in serialisable]
+    resampled_count = int(sum(1 for c in serialisable if bool(c.get("resampled", False))))
+    effective_fps_summary = {
+        "min": round(float(np.min(eff_fps_values)), 3) if eff_fps_values else round(float(fps), 3),
+        "median": round(float(np.median(eff_fps_values)), 3) if eff_fps_values else round(float(fps), 3),
+        "max": round(float(np.max(eff_fps_values)), 3) if eff_fps_values else round(float(fps), 3),
+    }
+
     return {
         "bpm": round(fused_bpm, 1) if fused_bpm > 0 else None,
         "quality": round(best_quality, 4),
@@ -579,7 +912,13 @@ def estimate_heart_rate_multi_roi(
         "roi_scores": per_roi_signal_quality,
         "roi_color_variance": per_roi_color_var,
         "roi_illumination_stability": per_roi_illum_stab,
+        "roi_adaptive_weights": adaptive_roi_weights,
         "method_scores": method_scores,
+        "method_adaptive_weights": method_weights,
+        "candidate_rejections": candidate_rejections,
+        "resampled_candidate_count": resampled_count,
+        "resampled_candidate_ratio": round(float(resampled_count / max(len(serialisable), 1)), 4),
+        "effective_fps_summary": effective_fps_summary,
         # Part 5: harmonic correction + peak debug fields from best candidate
         "harmonic_checked": best.get("harmonic_checked", False),
         "harmonic_corrected": best.get("harmonic_corrected", False),

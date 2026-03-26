@@ -133,6 +133,20 @@ class FinalScoreRequest(BaseModel):
     symptom_result: Optional[Dict[str, Any]] = None
 
 
+class FaceLiveSignalRequest(BaseModel):
+    """Body for POST /predict/face-live
+
+    Lightweight payload sent after a 30-second local camera scan.
+    """
+    signal: List[float] = Field(..., min_length=8)
+    duration_sec: float = Field(..., gt=0, le=120)
+    sampling_hz: float = Field(..., gt=0, le=30)
+    frames_seen: Optional[int] = Field(None, ge=0)
+    frames_processed: Optional[int] = Field(None, ge=0)
+    frames_skipped: Optional[int] = Field(None, ge=0)
+    brightness_mean: Optional[float] = Field(None, ge=0)
+
+
 # ---------------------------------------------------------------------------
 # Auth & User Schemas
 # ---------------------------------------------------------------------------
@@ -148,6 +162,18 @@ class LoginRequest(BaseModel):
     """Body for POST /auth/login"""
     email: str = Field(..., min_length=5)
     password: str = Field(..., min_length=1)
+
+
+class UpdateProfileRequest(BaseModel):
+    """Body for PUT /auth/me"""
+    name: str = Field(..., min_length=2, max_length=100)
+
+
+class ChangePasswordRequest(BaseModel):
+    """Body for POST /auth/change-password"""
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=6)
+    confirm_password: str = Field(..., min_length=6)
 
 
 class UserResponse(BaseModel):

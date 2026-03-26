@@ -41,7 +41,8 @@ class _ScanCircleSpec {
 
 class FaceScanScreen extends StatefulWidget {
   final int userId;
-  const FaceScanScreen({super.key, required this.userId});
+  final String? userName;
+  const FaceScanScreen({super.key, required this.userId, this.userName});
   @override
   State<FaceScanScreen> createState() => _FaceScanScreenState();
 }

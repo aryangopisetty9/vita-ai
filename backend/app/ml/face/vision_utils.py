@@ -150,6 +150,121 @@ def mean_rgb_from_roi(
     return mean_bgr[::-1].copy()  # BGR → RGB
 
 
+def _tile_bounds(height: int, width: int, rows: int = 2, cols: int = 3) -> List[Tuple[int, int, int, int]]:
+    """Generate tile bounds as (y0, y1, x0, x1)."""
+    ys = np.linspace(0, height, rows + 1, dtype=int)
+    xs = np.linspace(0, width, cols + 1, dtype=int)
+    bounds: List[Tuple[int, int, int, int]] = []
+    for r in range(rows):
+        for c in range(cols):
+            y0, y1 = int(ys[r]), int(ys[r + 1])
+            x0, x1 = int(xs[c]), int(xs[c + 1])
+            if y1 > y0 and x1 > x0:
+                bounds.append((y0, y1, x0, x1))
+    return bounds
+
+
+def _tile_quality_weight(tile: np.ndarray, tile_mask: np.ndarray) -> float:
+    """Quality weight for a tile using exposure, blur, and edge contamination."""
+    valid = int(np.sum(tile_mask > 0))
+    if valid < 10:
+        return 0.0
+
+    skin_cov = float(valid / max(tile_mask.size, 1))
+    oe = overexposure_ratio(tile, tile_mask)
+
+    if _HAS_CV2:
+        gray = cv2.cvtColor(tile, cv2.COLOR_BGR2GRAY)
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        edge = cv2.Canny(gray, 80, 160)
+        edge_density = float(np.mean(edge[tile_mask > 0] > 0)) if valid > 0 else 0.0
+    else:
+        lap_var = 80.0
+        edge_density = 0.0
+
+    blur_q = float(np.clip(lap_var / 80.0, 0.0, 1.0))
+    oe_pen = float(np.clip(1.0 - oe / 0.35, 0.0, 1.0))
+    edge_pen = float(np.clip(1.0 - edge_density / 0.35, 0.0, 1.0))
+    return float(np.clip(0.45 * skin_cov + 0.25 * blur_q + 0.20 * oe_pen + 0.10 * edge_pen, 0.0, 1.0))
+
+
+def mean_green_from_roi_tiled(
+    roi: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+    rows: int = 2,
+    cols: int = 3,
+) -> Optional[float]:
+    """Weighted green mean from sub-ROI tiles, keeping only stronger tiles."""
+    if roi is None or roi.size == 0:
+        return None
+
+    h, w = roi.shape[:2]
+    if h < 6 or w < 6:
+        return mean_green_from_roi(roi, mask)
+
+    tile_vals: List[float] = []
+    tile_weights: List[float] = []
+    for y0, y1, x0, x1 in _tile_bounds(h, w, rows=rows, cols=cols):
+        t_roi = roi[y0:y1, x0:x1]
+        t_mask = None if mask is None else mask[y0:y1, x0:x1]
+        g = mean_green_from_roi(t_roi, t_mask)
+        if g is None:
+            continue
+        if t_mask is None:
+            t_mask = np.ones(t_roi.shape[:2], dtype=np.uint8) * 255
+        w_q = _tile_quality_weight(t_roi, t_mask)
+        if w_q < 0.15:
+            continue
+        tile_vals.append(float(g))
+        tile_weights.append(w_q)
+
+    if not tile_vals:
+        return mean_green_from_roi(roi, mask)
+
+    w_arr = np.array(tile_weights, dtype=np.float64)
+    v_arr = np.array(tile_vals, dtype=np.float64)
+    return float(np.dot(v_arr, w_arr) / np.sum(w_arr))
+
+
+def mean_rgb_from_roi_tiled(
+    roi: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+    rows: int = 2,
+    cols: int = 3,
+) -> Optional[np.ndarray]:
+    """Weighted RGB mean from sub-ROI tiles, rejecting weak tiles."""
+    if roi is None or roi.size == 0:
+        return None
+
+    h, w = roi.shape[:2]
+    if h < 6 or w < 6:
+        return mean_rgb_from_roi(roi, mask)
+
+    tile_vals: List[np.ndarray] = []
+    tile_weights: List[float] = []
+    for y0, y1, x0, x1 in _tile_bounds(h, w, rows=rows, cols=cols):
+        t_roi = roi[y0:y1, x0:x1]
+        t_mask = None if mask is None else mask[y0:y1, x0:x1]
+        rgb = mean_rgb_from_roi(t_roi, t_mask)
+        if rgb is None:
+            continue
+        if t_mask is None:
+            t_mask = np.ones(t_roi.shape[:2], dtype=np.uint8) * 255
+        w_q = _tile_quality_weight(t_roi, t_mask)
+        if w_q < 0.15:
+            continue
+        tile_vals.append(rgb.astype(np.float64))
+        tile_weights.append(w_q)
+
+    if not tile_vals:
+        return mean_rgb_from_roi(roi, mask)
+
+    w_arr = np.array(tile_weights, dtype=np.float64)
+    v_arr = np.vstack(tile_vals)
+    weighted = (v_arr * w_arr[:, None]).sum(axis=0) / max(np.sum(w_arr), 1e-9)
+    return weighted.astype(np.float64)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Skin-tone HSV mask
 # ═══════════════════════════════════════════════════════════════════════════
@@ -307,6 +422,20 @@ def frame_brightness(frame_bgr: np.ndarray) -> float:
         return 128.0
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     return float(np.mean(hsv[:, :, 2]))
+
+
+def frame_blur_metrics(frame_bgr: np.ndarray) -> Dict[str, float]:
+    """Return blur diagnostics using Laplacian variance."""
+    if frame_bgr is None or frame_bgr.size == 0 or not _HAS_CV2:
+        return {"laplacian_var": 0.0, "blur_quality": 0.0}
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    # <=15: very blurry, >=80: usually sharp enough for ROI photoplethysmography.
+    blur_quality = float(np.clip((lap_var - 15.0) / 65.0, 0.0, 1.0))
+    return {
+        "laplacian_var": round(lap_var, 4),
+        "blur_quality": round(blur_quality, 4),
+    }
 
 
 def apply_clahe(frame_bgr: np.ndarray, clip_limit: float = 2.0,

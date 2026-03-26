@@ -46,6 +46,9 @@ It is **not** a medical diagnostic system.
 
 from __future__ import annotations
 
+import csv
+import datetime
+import json
 import logging
 import os
 from pathlib import Path
@@ -107,7 +110,6 @@ from backend.app.ml.face.rppg_utils import (
     extract_frame_overexposure,
 )
 from backend.app.ml.face.vision_utils import (
-    HEAD_ANCHORS,
     LEFT_CHEEK,
     LEFT_IRIS,
     REGION_LANDMARKS,
@@ -117,6 +119,7 @@ from backend.app.ml.face.vision_utils import (
     denoise_frame,
     extract_anchor_positions,
     extract_face_roi_haar,
+    frame_blur_metrics,
     frame_brightness,
     frame_overexposure_ratio,
     gamma_correct,
@@ -127,22 +130,16 @@ from backend.app.ml.face.vision_utils import (
     compute_roi_quality_metrics,
     extract_forehead_roi,
     extract_cheek_roi,
-    build_skin_mask,
 )
 from backend.app.utils.signal_processing import (
     compute_hr_timeseries,
-    compute_periodicity,
-    compute_signal_strength,
-    estimate_bpm,
     median_filter_bpm,
     robust_hr_consensus,
-    select_best_windows,
 )
 from backend.app.ml.face.rppg_models import (
     compare_with_signal_pipeline,
     infer_rppg_models,
 )
-from backend.app.ml.face.rppg_recovery import recover_heart_rate
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -154,9 +151,44 @@ _HR_STRIDE_SEC = 0.5
 _MAX_MODEL_FRAMES = 300  # max frames to keep for model inference
 _MIN_CONSENSUS_WINDOWS = 2  # lowered from 4 — web/mobile cameras often produce only 2-4 quality windows
 
+# Conservative real-world tuning for average webcams/phones.
+_LOW_BRIGHTNESS_MIN_QUALITY = 0.06
+_BLUR_MIN_QUALITY = 0.05
+_ROI_DRIFT_REJECT_PX = 22.0
+_FRAME_OVEREXPOSURE_REJECT = 0.68
+_MIN_TEMPORAL_COVERAGE_SEC = 4.5
+_MAX_TEMPORAL_COVERAGE_SEC = 16.0
+_TEMPORAL_COVERAGE_RATIO = 0.28
+_UNSTABLE_SAMPLING_JITTER_CV = 0.40
+_UNSTABLE_SAMPLING_MIN_EFF_FPS = 5.5
+_FINAL_MIN_SIGNAL_PERIODICITY = 0.17
+_FINAL_MIN_SIGNAL_STRENGTH = 0.07
+_FINAL_MIN_VALID_WINDOWS = 2
+_STRONG_MIN_PERIODICITY = 0.22
+_STRONG_MIN_SIGNAL_STRENGTH = 0.10
+_STRONG_MIN_VALID_WINDOWS = 3
+_STRONG_MAX_STD_DEV = 11.0
+_WEAK_MIN_PERIODICITY = 0.08
+_WEAK_MIN_SIGNAL_STRENGTH = 0.03
+_WEAK_MIN_VALID_WINDOWS = 1
+_WEAK_MAX_STD_DEV = 22.0
+_SEVERE_JITTER_CV = 0.65
+_SEVERE_MIN_EFF_FPS = 4.0
+_CATASTROPHIC_MOTION_MULT = 1.15
+_CATASTROPHIC_LOW_BRIGHTNESS = 0.18
+_CATASTROPHIC_OVEREXPOSURE = 0.75
+
+# Diagnostics export controls.
+_DIAG_EXPORT_ENV = "VITA_FACE_DIAGNOSTICS_EXPORT"
+_DIAG_EXPORT_PATH_ENV = "VITA_FACE_DIAGNOSTICS_PATH"
+_MIN_VALID_FPS = 8.0
+_MAX_VALID_FPS = 60.0
+_DEFAULT_FPS = 30.0
+MIN_ANALYSIS_FPS = 12.0
+LOW_FPS_SAFE_DEFAULT = 15.0
+
 # Cross-run smoothing cache (process-local).
-_LAST_HR_EMA: Dict[str, Optional[float]] = {"file": None, "stream": None}
-_CROSS_RUN_ALPHA = 0.7
+# Keep each scan independent: no state is carried across runs.
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -184,6 +216,10 @@ def _build_error_result(message: str, debug: Optional[Dict[str, Any]] = None) ->
         "confidence": 0.0,
         "hr_confidence": 0.0,
         "reliability": "unreliable",
+        "hr_result_tier": "result_unavailable",
+        "result_available": False,
+        "retake_recommended": True,
+        "estimated_from_weak_signal": False,
         "signal_strength": 0.0,
         "periodicity_score": 0.0,
         "valid_windows": 0,
@@ -203,6 +239,135 @@ def _build_error_result(message: str, debug: Optional[Dict[str, Any]] = None) ->
         "value": None,
         "unit": "bpm",
     }
+
+
+def _diag_export_enabled() -> bool:
+    return os.getenv(_DIAG_EXPORT_ENV, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _diag_export_path() -> Path:
+    raw = os.getenv(_DIAG_EXPORT_PATH_ENV, "").strip()
+    if raw:
+        return Path(raw)
+    return Path(__file__).resolve().parents[4] / "temp" / "face_scan_diagnostics.jsonl"
+
+
+def _stringify_map(value: Any) -> str:
+    if isinstance(value, dict):
+        try:
+            return json.dumps(value, separators=(",", ":"), sort_keys=True)
+        except Exception:
+            return str(value)
+    return "{}"
+
+
+def _select_chosen_candidate(result: Dict[str, Any], debug: Dict[str, Any]) -> Dict[str, Any]:
+    selected_roi = debug.get("selected_roi")
+    selected_method = debug.get("selected_method")
+    candidates = debug.get("all_candidate_scores") or []
+    if isinstance(candidates, list):
+        for c in candidates:
+            if not isinstance(c, dict):
+                continue
+            if c.get("roi") == selected_roi and c.get("method") == selected_method:
+                return c
+    return {}
+
+
+def _build_diag_record(result: Dict[str, Any], source: str) -> Dict[str, Any]:
+    debug = result.get("debug") if isinstance(result.get("debug"), dict) else {}
+    timing = debug.get("timing") if isinstance(debug.get("timing"), dict) else {}
+    chosen = _select_chosen_candidate(result, debug)
+    hr_reasons = result.get("hr_rejection_reasons")
+    if not isinstance(hr_reasons, list):
+        hr_reasons = []
+
+    acceptance = "accepted" if (result.get("heart_rate") is not None) else "rejected"
+    return {
+        "ts_utc": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "source": source,
+        "final_status": acceptance,
+        "final_acceptance": debug.get("final_acceptance_reason", ""),
+        "heart_rate": result.get("heart_rate"),
+        "frame_count": debug.get("frames_processed", 0),
+        "usable_frame_count": debug.get("usable_frame_count", debug.get("valid_frames", 0)),
+        "effective_fps": timing.get("effective_fps", debug.get("effective_fps", 0.0)),
+        "cadence_jitter_cv": timing.get("cadence_jitter_cv", debug.get("cadence_jitter_cv", 0.0)),
+        "dropped_frame_estimate": timing.get("estimated_dropped_frames", 0),
+        "low_brightness_reject_count": debug.get("low_brightness_reject_count", 0),
+        "blur_reject_count": debug.get("blur_reject_count", 0),
+        "motion_reject_count": debug.get("motion_reject_count", 0),
+        "roi_instability_reject_count": debug.get("roi_instability_reject_count", 0),
+        "roi_adaptive_weights": _stringify_map(debug.get("roi_adaptive_weights", {})),
+        "method_adaptive_weights": _stringify_map(debug.get("method_adaptive_weights", {})),
+        "candidate_periodicity": chosen.get("periodicity", result.get("periodicity_score", 0.0)),
+        "candidate_signal_strength": chosen.get("signal_strength", result.get("signal_strength", 0.0)),
+        "valid_windows": result.get("valid_windows", debug.get("valid_window_count", 0)),
+        "window_std": debug.get("std_dev", 0.0),
+        "chosen_roi": debug.get("selected_roi", ""),
+        "chosen_method": debug.get("selected_method", result.get("method_used", "")),
+        "final_reliability": result.get("reliability", "unreliable"),
+        "hr_result_tier": result.get("hr_result_tier", "result_unavailable"),
+        "result_available": bool(result.get("result_available", False)),
+        "estimated_from_weak_signal": bool(result.get("estimated_from_weak_signal", False)),
+        "retake_recommended": bool(result.get("retake_recommended", result.get("retake_required", False))),
+        "hr_rejection_reasons": json.dumps(hr_reasons),
+    }
+
+
+def _export_diag_record(record: Dict[str, Any]) -> None:
+    if not _diag_export_enabled():
+        return
+    out_path = _diag_export_path()
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if out_path.suffix.lower() == ".csv":
+            fieldnames = [
+                "ts_utc",
+                "source",
+                "final_status",
+                "final_acceptance",
+                "heart_rate",
+                "frame_count",
+                "usable_frame_count",
+                "effective_fps",
+                "cadence_jitter_cv",
+                "dropped_frame_estimate",
+                "low_brightness_reject_count",
+                "blur_reject_count",
+                "motion_reject_count",
+                "roi_instability_reject_count",
+                "roi_adaptive_weights",
+                "method_adaptive_weights",
+                "candidate_periodicity",
+                "candidate_signal_strength",
+                "valid_windows",
+                "window_std",
+                "chosen_roi",
+                "chosen_method",
+                "final_reliability",
+                "hr_result_tier",
+                "result_available",
+                "estimated_from_weak_signal",
+                "retake_recommended",
+                "hr_rejection_reasons",
+            ]
+            exists = out_path.exists() and out_path.stat().st_size > 0
+            with out_path.open("a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not exists:
+                    writer.writeheader()
+                writer.writerow({k: record.get(k, "") for k in fieldnames})
+        else:
+            with out_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=True) + "\n")
+    except Exception as exc:
+        logger.debug("Face diagnostics export failed: %s", exc)
+
+
+def _emit_result(result: Dict[str, Any], source: str) -> Dict[str, Any]:
+    _export_diag_record(_build_diag_record(result, source=source))
+    return result
 
 
 def _classify_hr(bpm: float) -> Tuple[str, str]:
@@ -238,6 +403,114 @@ def _derive_reliability(
     return "low"
 
 
+def _evaluate_hr_result_tier(
+    *,
+    bpm: Optional[float],
+    periodicity: float,
+    signal_strength: float,
+    valid_windows: int,
+    std_dev: float,
+    peak_support_count: int,
+    selected_roi: Optional[str],
+    timing_diag: Dict[str, Any],
+    avg_motion: float,
+    mean_brightness: float,
+    mean_overexposure: float,
+) -> Dict[str, Any]:
+    """Classify HR outcome into result_available or result_unavailable."""
+    if bpm is None or bpm <= 0:
+        return {
+            "tier": "result_unavailable",
+            "result_available": False,
+            "estimated_from_weak_signal": False,
+            "reasons": ["no_viable_candidate"],
+        }
+
+    jitter_cv = float(timing_diag.get("cadence_jitter_cv", 0.0) or 0.0)
+    eff_fps = float(timing_diag.get("effective_fps", 0.0) or 0.0)
+    severe_sampling = bool(
+        timing_diag.get("unstable_sampling", False)
+        and (jitter_cv > _SEVERE_JITTER_CV or eff_fps < _SEVERE_MIN_EFF_FPS)
+    )
+    catastrophic_motion = avg_motion > (_MOTION_REJECT_THRESHOLD * _CATASTROPHIC_MOTION_MULT)
+    catastrophic_lighting = mean_brightness < _CATASTROPHIC_LOW_BRIGHTNESS
+    catastrophic_exposure = mean_overexposure > _CATASTROPHIC_OVEREXPOSURE
+    catastrophic_scene = catastrophic_motion or catastrophic_lighting or catastrophic_exposure
+
+    # Availability-first policy: if we have a current-scan candidate BPM,
+    # only hard-fail on clearly catastrophic technical conditions.
+    has_consistent_candidate = bool(
+        selected_roi is not None
+        or valid_windows >= 1
+        or peak_support_count >= 1
+        or (periodicity >= 0.02 and signal_strength >= 0.02)
+    )
+    minimal_signal = bool(periodicity >= 0.02 or signal_strength >= 0.02)
+
+    strong_evidence = bool(
+        has_consistent_candidate
+        and periodicity >= _STRONG_MIN_PERIODICITY
+        and signal_strength >= _STRONG_MIN_SIGNAL_STRENGTH
+        and valid_windows >= _STRONG_MIN_VALID_WINDOWS
+        and std_dev <= _STRONG_MAX_STD_DEV
+        and not timing_diag.get("unstable_sampling", False)
+        and peak_support_count >= 2
+    )
+    hard_failure = bool(
+        severe_sampling
+        or catastrophic_scene
+        or (not has_consistent_candidate)
+        or (not minimal_signal and valid_windows <= 0 and peak_support_count <= 0)
+    )
+
+    if not hard_failure:
+        weak_flags: List[str] = []
+        if not strong_evidence:
+            weak_flags.append("retake_recommended")
+            if periodicity < _STRONG_MIN_PERIODICITY:
+                weak_flags.append("borderline_periodicity")
+            if signal_strength < _STRONG_MIN_SIGNAL_STRENGTH:
+                weak_flags.append("weak_signal")
+            if valid_windows < _STRONG_MIN_VALID_WINDOWS:
+                weak_flags.append("limited_windows")
+            if timing_diag.get("unstable_sampling", False):
+                weak_flags.append("unstable_sampling")
+        return {
+            "tier": "result_available",
+            "result_available": True,
+            "estimated_from_weak_signal": not strong_evidence,
+            "reasons": weak_flags,
+        }
+
+    reject_reasons: List[str] = []
+    if severe_sampling:
+        reject_reasons.append("extreme_unstable_sampling")
+    if catastrophic_motion:
+        reject_reasons.append("severe_motion")
+    if catastrophic_lighting:
+        reject_reasons.append("catastrophic_low_light")
+    if catastrophic_exposure:
+        reject_reasons.append("catastrophic_overexposure")
+    if not has_consistent_candidate:
+        reject_reasons.append("no_consistent_candidate")
+    if periodicity < _WEAK_MIN_PERIODICITY:
+        reject_reasons.append("weak_periodicity")
+    if signal_strength < _WEAK_MIN_SIGNAL_STRENGTH:
+        reject_reasons.append("low_snr")
+    if valid_windows < _WEAK_MIN_VALID_WINDOWS:
+        reject_reasons.append("insufficient_windows")
+    if std_dev > _WEAK_MAX_STD_DEV:
+        reject_reasons.append("inconsistent_windows")
+    if not reject_reasons:
+        reject_reasons.append("insufficient_signal")
+    return {
+        "tier": "result_unavailable",
+        "result_available": False,
+        "estimated_from_weak_signal": False,
+        "reasons": reject_reasons,
+    }
+
+
 def _stability_label(std_dev: float) -> str:
     """Map HR variability to a user-facing stability label."""
     if std_dev < 3.0:
@@ -261,15 +534,82 @@ def _build_spatially_averaged_trace(roi_traces: Dict[str, List[float]]) -> List[
     return merged.tolist()
 
 
+def _compute_timing_diagnostics(
+    timestamps: List[float],
+    nominal_fps: float,
+) -> Dict[str, Any]:
+    """Summarise temporal cadence stability for timestamp-aware processing."""
+    if len(timestamps) < 2:
+        return {
+            "coverage_sec": 0.0,
+            "effective_fps": round(float(max(nominal_fps, 0.0)), 3),
+            "cadence_jitter_cv": 0.0,
+            "estimated_dropped_frames": 0,
+            "unstable_sampling": True,
+        }
+
+    t = np.asarray(timestamps, dtype=np.float64)
+    t = t[np.isfinite(t)]
+    if len(t) < 2:
+        return {
+            "coverage_sec": 0.0,
+            "effective_fps": round(float(max(nominal_fps, 0.0)), 3),
+            "cadence_jitter_cv": 0.0,
+            "estimated_dropped_frames": 0,
+            "unstable_sampling": True,
+        }
+    t = np.sort(t)
+    dts = np.diff(t)
+    dts = dts[dts > 1e-4]
+    if len(dts) == 0:
+        return {
+            "coverage_sec": 0.0,
+            "effective_fps": round(float(max(nominal_fps, 0.0)), 3),
+            "cadence_jitter_cv": 0.0,
+            "estimated_dropped_frames": 0,
+            "unstable_sampling": True,
+        }
+
+    coverage = float(t[-1] - t[0])
+    med_dt = float(np.median(dts))
+    mean_dt = float(np.mean(dts))
+    dt_std = float(np.std(dts))
+    eff_fps = float((len(t) - 1) / coverage) if coverage > 1e-6 else float(nominal_fps)
+    jitter_cv = float(dt_std / max(mean_dt, 1e-6))
+    expected = int(round(coverage * max(nominal_fps, 1e-6))) + 1
+    dropped_est = int(max(expected - len(t), 0))
+    unstable_sampling = bool(
+        jitter_cv > _UNSTABLE_SAMPLING_JITTER_CV
+        or eff_fps < _UNSTABLE_SAMPLING_MIN_EFF_FPS
+    )
+
+    return {
+        "coverage_sec": round(max(coverage, 0.0), 3),
+        "effective_fps": round(eff_fps, 3),
+        "median_dt_sec": round(med_dt, 4),
+        "cadence_jitter_cv": round(jitter_cv, 4),
+        "estimated_dropped_frames": dropped_est,
+        "unstable_sampling": unstable_sampling,
+    }
+
+
+def _sanitize_capture_fps(raw_fps: float) -> float:
+    """Return a safe FPS value when container metadata is incorrect."""
+    if not np.isfinite(raw_fps):
+        return _DEFAULT_FPS
+    if _MIN_VALID_FPS <= float(raw_fps) <= _MAX_VALID_FPS:
+        return float(raw_fps)
+    return _DEFAULT_FPS
+
+
 def _apply_cross_run_smoothing(current_hr: float, channel: str) -> Tuple[float, Optional[float]]:
-    """EMA smoothing against previous scan result for run-to-run consistency."""
-    prev = _LAST_HR_EMA.get(channel)
-    if prev is None:
-        _LAST_HR_EMA[channel] = current_hr
-        return round(current_hr, 1), None
-    smoothed = _CROSS_RUN_ALPHA * current_hr + (1.0 - _CROSS_RUN_ALPHA) * prev
-    _LAST_HR_EMA[channel] = smoothed
-    return round(float(smoothed), 1), round(abs(current_hr - prev), 2)
+    """Return the current scan HR unchanged.
+
+    Cross-run smoothing is intentionally disabled to prevent prior scans from
+    influencing the current result.
+    """
+    _ = channel
+    return round(current_hr, 1), None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -301,24 +641,26 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
     """
     # --- Pre-checks ---
     if not _HAS_CV2:
-        return _build_error_result(
+        return _emit_result(_build_error_result(
             "OpenCV is not installed. Cannot process video.",
             {"dependency_missing": "opencv-python"},
-        )
+        ), source="file")
     if not video_path or not os.path.isfile(str(video_path)):
-        return _build_error_result(
+        return _emit_result(_build_error_result(
             "Video file not found or path is invalid.",
             {"video_path": video_path},
-        )
+        ), source="file")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return _build_error_result(
+        return _emit_result(_build_error_result(
             "Could not open video file.",
             {"video_path": video_path},
-        )
+        ), source="file")
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    raw_fps = float(cap.get(cv2.CAP_PROP_FPS) or _DEFAULT_FPS)
+    fps = _sanitize_capture_fps(raw_fps)
+    analysis_fps = LOW_FPS_SAFE_DEFAULT if fps < MIN_ANALYSIS_FPS else fps
 
     # --- Set up face detector ---
     face_mesh = None
@@ -347,6 +689,7 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
 
     # --- Per-frame accumulators ---
     roi_traces: Dict[str, List[float]] = {name: [] for name in ROI_NAMES}
+    roi_timestamps: Dict[str, List[float]] = {name: [] for name in ROI_NAMES}
     roi_rgb_traces: Dict[str, List[np.ndarray]] = {name: [] for name in ROI_NAMES}
     roi_overexposure: Dict[str, List[float]] = {name: [] for name in ROI_NAMES}
     roi_skin_quality: Dict[str, List[float]] = {name: [] for name in ROI_NAMES}
@@ -363,15 +706,23 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
     brightness_scores: List[float] = []
     overexposure_ratios: List[float] = []
     roi_drift_scores: List[float] = []
+    blur_scores: List[float] = []
+    valid_timestamps: List[float] = []
 
     frames_read = 0
     face_detected_count = 0
     valid_frame_count = 0
     overexposed_reject_count = 0
+    low_brightness_reject_count = 0
+    blur_reject_count = 0
+    motion_reject_count = 0
+    roi_instability_reject_count = 0
 
     blink_detector = BlinkDetector()
     prev_anchors: Optional[np.ndarray] = None
     landmark_smoother = LandmarkSmoother(alpha=0.6)
+    prev_frame_ts: Optional[float] = None
+    prev_raw_ts: Optional[float] = None
 
     # ══════════════════════════════════════════════════════════════
     # Frame loop
@@ -383,6 +734,21 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
         frames_read += 1
         h, w = frame.shape[:2]
 
+        raw_ts_sec = float(cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0)
+        has_good_raw_ts = (
+            np.isfinite(raw_ts_sec)
+            and raw_ts_sec > 0
+            and (prev_raw_ts is None or raw_ts_sec > prev_raw_ts + 1e-4)
+        )
+        if has_good_raw_ts:
+            frame_ts_sec = raw_ts_sec
+            prev_raw_ts = raw_ts_sec
+        else:
+            frame_ts_sec = float(frames_read / max(fps, 1e-6))
+        if prev_frame_ts is not None and frame_ts_sec <= prev_frame_ts:
+            frame_ts_sec = prev_frame_ts + (1.0 / max(fps, 1e-6))
+        prev_frame_ts = frame_ts_sec
+
         # --- Frame-level brightness ---
         bright = frame_brightness(frame)
         bq = _brightness_quality(bright)
@@ -391,6 +757,11 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
         # --- Frame-level overexposure ---
         oe = frame_overexposure_ratio(frame)
         overexposure_ratios.append(oe)
+
+        # --- Frame-level blur quality ---
+        blur_meta = frame_blur_metrics(frame)
+        blur_q = float(blur_meta.get("blur_quality", 0.0))
+        blur_scores.append(blur_q)
 
         # --- Denoise for low-quality webcam noise ---
         frame = denoise_frame(frame)
@@ -406,7 +777,7 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
         if face_mesh is not None:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int((frames_read / fps) * 1000)
+            timestamp_ms = int(frame_ts_sec * 1000)
             results = face_mesh.detect_for_video(mp_image, timestamp_ms)
 
             if results.face_landmarks:
@@ -429,15 +800,32 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
                 landmark_smoother.smooth_to_landmarks(lm_list, h, w)
 
                 # Frame quality check
-                fq = _brightness_quality(bright) * (1.0 / (1.0 + motion_mag * 0.5))
+                drift_penalty = float(np.clip(1.0 / (1.0 + max(drift, 0.0) * 0.08), 0.0, 1.0))
+                fq = _brightness_quality(bright) * blur_q * (1.0 / (1.0 + motion_mag * 0.5)) * drift_penalty
                 frame_qualities.append(fq)
+
+                # Skip very dark frames (insufficient skin contrast).
+                if bq < _LOW_BRIGHTNESS_MIN_QUALITY:
+                    low_brightness_reject_count += 1
+                    continue
+
+                # Skip strongly blurred frames.
+                if blur_q < _BLUR_MIN_QUALITY:
+                    blur_reject_count += 1
+                    continue
+
+                # Skip if ROI geometry is unstable (landmark drift spike).
+                if drift > _ROI_DRIFT_REJECT_PX:
+                    roi_instability_reject_count += 1
+                    continue
 
                 # Skip frame if motion too large (don't corrupt pulse signal)
                 if motion_mag > _MOTION_REJECT_THRESHOLD:
+                    motion_reject_count += 1
                     continue
 
                 # Skip frame if heavily overexposed (blown-out ROIs)
-                if oe > 0.50:
+                if oe > _FRAME_OVEREXPOSURE_REJECT:
                     overexposed_reject_count += 1
                     continue
 
@@ -448,11 +836,14 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
                     model_frames.append(frame.copy())
 
                 # 1) Multi-ROI green-channel extraction
+                ts_sec = frame_ts_sec
+                valid_timestamps.append(ts_sec)
                 roi_vals = extract_frame_roi_signals(frame, lm_list, h, w)
                 for name in ROI_NAMES:
                     v = roi_vals.get(name)
                     if v is not None:
                         roi_traces[name].append(v)
+                        roi_timestamps[name].append(ts_sec)
 
                 # 1b) Multi-ROI RGB extraction (for POS projection)
                 roi_rgb = extract_frame_roi_rgb(frame, lm_list, h, w)
@@ -535,30 +926,83 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
     debug_info: Dict[str, Any] = {
         "frames_processed": frames_read,
         "valid_frames": valid_frame_count,
+        "dropped_frames": max(frames_read - valid_frame_count, 0),
         "frames_with_face": face_detected_count,
-        "fps": round(fps, 1),
+        "fps": round(analysis_fps, 1),
+        "capture_fps": round(fps, 1),
+        "raw_fps": round(raw_fps, 3),
         "duration_sec": round(duration_sec, 2),
     }
+    timing_diag = _compute_timing_diagnostics(valid_timestamps, fps)
+    timing_eff_fps = float(timing_diag.get("effective_fps", fps))
+    if timing_eff_fps < MIN_ANALYSIS_FPS:
+        analysis_fps = LOW_FPS_SAFE_DEFAULT
+    debug_info["analysis_fps"] = round(analysis_fps, 3)
+    duration_from_coverage = float(timing_diag.get("coverage_sec", 0.0))
+    if duration_from_coverage > duration_sec:
+        duration_sec = duration_from_coverage
+        debug_info["duration_sec"] = round(duration_sec, 2)
+    debug_info["timing"] = timing_diag
+    debug_info["raw_effective_fps"] = timing_diag["effective_fps"]
+    debug_info["effective_fps"] = round(analysis_fps, 3)
+    debug_info["cadence_jitter_cv"] = timing_diag["cadence_jitter_cv"]
+    debug_info["low_brightness_reject_count"] = low_brightness_reject_count
+    debug_info["blur_reject_count"] = blur_reject_count
+    debug_info["motion_reject_count"] = motion_reject_count
+    debug_info["roi_instability_reject_count"] = roi_instability_reject_count
 
     # --- Guard: too few frames ---
     if frames_read < FACE_MIN_FRAMES:
-        return _build_error_result(
+        return _emit_result(_build_error_result(
             f"Video too short ({frames_read} frames). Need at least {FACE_MIN_FRAMES}.",
             debug_info,
-        )
+        ), source="file")
     if face_detected_count < FACE_MIN_FRAMES:
-        return _build_error_result(
+        return _emit_result(_build_error_result(
             "Face not detected in enough frames for reliable estimation.",
             debug_info,
-        )
+        ), source="file")
     # Guard: too few *usable* frames (passes motion + overexposure filters)
-    _MIN_USABLE_FRAMES = max(FACE_MIN_FRAMES // 2, 15)
+    _MIN_USABLE_FRAMES = max(FACE_MIN_FRAMES // 3, 10)
     if valid_frame_count < _MIN_USABLE_FRAMES:
-        return _build_error_result(
+        return _emit_result(_build_error_result(
             f"Too few usable frames ({valid_frame_count}) after filtering motion "
             f"and overexposure. Need at least {_MIN_USABLE_FRAMES}. "
             "Please rescan in stable lighting and keep your head still.",
             debug_info,
+        ), source="file")
+    min_temporal_coverage = max(
+        _MIN_TEMPORAL_COVERAGE_SEC,
+        min(_MAX_TEMPORAL_COVERAGE_SEC, duration_sec * _TEMPORAL_COVERAGE_RATIO),
+    )
+    if float(timing_diag.get("coverage_sec", 0.0)) < min_temporal_coverage:
+        return _emit_result(_build_error_result(
+            "Insufficient temporal coverage after frame-quality filtering. "
+            "Please hold still for longer under steady lighting.",
+            {
+                **debug_info,
+                "required_coverage_sec": round(min_temporal_coverage, 2),
+            },
+        ), source="file")
+
+    # --- Pretrained rPPG model inference (optional layer; attempt early) ---
+    try:
+        model_result = infer_rppg_models(model_frames, analysis_fps)
+    except Exception as exc:
+        logger.warning("Pretrained rPPG model inference failed; using classical pipeline: %s", exc)
+        model_result = {
+            "available_models": [],
+            "model_priority": [],
+            "legacy_fallback_used": True,
+            "open_rppg_active": False,
+            "classical_fallback_used": True,
+            "fallback_reason": str(exc),
+        }
+
+    if not model_result.get("open_rppg_active", False):
+        logger.warning(
+            "Pretrained rPPG backend inactive; classical fallback in use. reason=%s",
+            model_result.get("fallback_reason"),
         )
 
     # --- 1. Multi-ROI heart rate estimation ---
@@ -575,10 +1019,11 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
         roi_skin_cov[name] = float(np.mean(sq)) if sq else 1.0
 
     hr_result = estimate_heart_rate_multi_roi(
-        roi_traces, roi_weights, fps, RPPG_LOW_HZ, RPPG_HIGH_HZ,
+        roi_traces, roi_weights, analysis_fps, RPPG_LOW_HZ, RPPG_HIGH_HZ,
         roi_rgb_traces=roi_rgb_traces,
         roi_overexposure=roi_overexposure,
         roi_skin_coverage=roi_skin_cov,
+        roi_timestamps=roi_timestamps,
     )
     bpm = hr_result["bpm"]
     hr_quality = hr_result["quality"]
@@ -595,10 +1040,15 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
     debug_info["signal_periodicity"] = periodicity
     debug_info["pos_used"] = hr_result.get("pos_used", False)
     debug_info["rois_dropped"] = hr_result.get("rois_dropped", [])
+    debug_info["roi_adaptive_weights"] = hr_result.get("roi_adaptive_weights", {})
+    debug_info["method_adaptive_weights"] = hr_result.get("method_adaptive_weights", {})
+    debug_info["candidate_rejections"] = hr_result.get("candidate_rejections", [])
+    debug_info["resampled_candidate_count"] = hr_result.get("resampled_candidate_count", 0)
+    debug_info["resampled_candidate_ratio"] = hr_result.get("resampled_candidate_ratio", 0.0)
+    debug_info["candidate_effective_fps"] = hr_result.get("effective_fps_summary", {})
     debug_info["overexposed_reject_count"] = overexposed_reject_count
 
-    # --- Pretrained rPPG model inference (optional layer) ---
-    model_result = infer_rppg_models(model_frames, fps)
+    # --- Pretrained rPPG model comparison (optional layer) ---
     comparison = compare_with_signal_pipeline(
         model_result,
         signal_bpm=bpm if bpm else 0.0,
@@ -655,7 +1105,8 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
         brightness_scores=brightness_scores,
         roi_agreement=roi_agreement,
         signal_periodicity=periodicity,
-        scan_duration_sec=duration_sec,
+        # Avoid false "scan too short" when timing coverage confirms a long scan.
+        scan_duration_sec=max(duration_sec, float(timing_diag.get("coverage_sec", 0.0))),
         min_duration_sec=10.0,
         overexposure_ratios=overexposure_ratios,
         usable_frame_count=valid_frame_count,
@@ -668,35 +1119,11 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
 
     debug_info["tracking_score"] = confidence_breakdown.get("tracking", 0)
 
-    # ── Recovery mode ─────────────────────────────────────────────────────
-    # Before declaring the scan unreliable, try multiple extraction strategies
-    # on the same frame data.  Only triggered when signal quality is weak.
-    _RECOVERY_TRIGGER_PERIOD = 0.18  # below this periodicity → attempt recovery
-    _recovery_result: Optional[Dict[str, Any]] = None
-    _recovery_triggered = (
-        bpm is None or bpm <= 0
-        or hr_quality < 0.05
-        or periodicity < _RECOVERY_TRIGGER_PERIOD
-    )
-    if _recovery_triggered and valid_frame_count >= 20:
-        _recovery_result = recover_heart_rate(
-            roi_traces, roi_rgb_traces, fps, RPPG_LOW_HZ, RPPG_HIGH_HZ
-        )
-        if _recovery_result["recovery_success"]:
-            # Use the best result found across all recovery stages.
-            # This is still derived from real signal data — not fabricated.
-            bpm = _recovery_result["bpm"]
-            hr_quality = _recovery_result["quality"]
-            periodicity = _recovery_result["periodicity"]
-        # Always log recovery details (success or failure)
-        debug_info["recovery"] = {
-            k: v for k, v in _recovery_result.items() if k != "attempt_log"
-        }
-        debug_info["recovery_attempt_log"] = _recovery_result["attempt_log"]
-    debug_info["recovery_triggered"] = _recovery_triggered
-    _recovery_succeeded = (
-        _recovery_result is not None and _recovery_result["recovery_success"]
-    )
+    # Recovery fallback is intentionally disabled in final scoring paths.
+    # We only report BPM that passes the primary pipeline evidence gates.
+    debug_info["recovery_triggered"] = False
+    debug_info["recovery"] = None
+    debug_info["recovery_attempt_log"] = []
 
     # --- HR timeseries (spatially-averaged ROI signal for better weak-signal stability) ---
     averaged_trace = _build_spatially_averaged_trace(roi_traces)
@@ -704,12 +1131,12 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
     source_trace = averaged_trace if averaged_trace else roi_traces[best_roi]
     hr_timeseries = compute_hr_timeseries(
         source_trace,
-        fps,
+        analysis_fps,
         _HR_WINDOW_SEC,
         _HR_STRIDE_SEC,
         RPPG_LOW_HZ,
         RPPG_HIGH_HZ,
-        min_window_quality=0.10,
+        min_window_quality=0.06,
     ) if source_trace else []
 
     # Temporal smoothing: remove transient spikes from the BPM trace
@@ -724,15 +1151,6 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
     )
     if hr_window_consensus["has_consensus"]:
         bpm = hr_window_consensus["heart_rate"]
-    elif (
-        hr_window_consensus.get("median_hr") is not None
-        and float(hr_window_consensus.get("std_dev", 999)) < 8.0
-        and int(hr_window_consensus.get("valid_window_count", 0)) >= 3
-        and 45.0 <= float(hr_window_consensus["median_hr"]) <= 180.0
-    ):
-        # Soft fallback: cluster gate just barely failed but timeseries median is
-        # stable enough to use.  More reliable than the raw competition winner.
-        bpm = hr_window_consensus["median_hr"]
 
     hr_filtered_values = hr_window_consensus.get("filtered_hr_values", [])
     hr_min = round(min(hr_filtered_values), 1) if hr_filtered_values else None
@@ -742,79 +1160,62 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
     stability = _stability_label(std_dev)
 
     # --- Determine final HR result ---
-    _MIN_SIGNAL_PERIODICITY = 0.10  # lowered — accept weaker periodic signals
-    _MIN_WEAK_WINDOWS = 1  # lowered — even 1 valid window is enough for a low-confidence estimate
-    windows_from_recovery = int((_recovery_result or {}).get("windows_accepted", 0))
-    valid_windows = max(int(hr_window_consensus.get("valid_window_count", 0)), windows_from_recovery)
-    method_used = (
-        (_recovery_result or {}).get("extraction_method_used", "multi_roi_primary")
-        if _recovery_succeeded else "multi_roi_primary"
-    )
+    valid_windows = int(hr_window_consensus.get("valid_window_count", 0))
+    method_used = "multi_roi_primary"
     if hr_window_consensus.get("has_consensus"):
         method_used = f"window_consensus_{hr_window_consensus.get('method', 'median')}"
-    has_min_signal = (
-        bpm is not None
-        and bpm > 0
-        and (
-            periodicity >= _MIN_SIGNAL_PERIODICITY
-            or valid_windows >= _MIN_WEAK_WINDOWS
-        )
-    )
 
     suppression_reason: Optional[str] = None
     rejection_reason: Optional[str] = None
+    rejection_codes: List[str] = []
     warning: Optional[str] = None
+    confidence_caps_applied: List[str] = []
     # Prefer competition engine signal_strength; fall back to old formula
     if competition_signal_strength > 0.0:
         signal_strength = float(np.clip(competition_signal_strength, 0.0, 1.0))
     else:
         signal_strength = float(np.clip(0.6 * max(hr_quality, 0.0) + 0.4 * max(periodicity, 0.0), 0.0, 1.0))
 
-    # --- Signal validation gate (soft degradation model) ---
-    # Instead of a binary kill-switch, weak-but-present signals are kept
-    # with degraded confidence so the score engine can fuse them at low
-    # weight.  Only truly catastrophic signals (no BPM / extreme noise)
-    # are hard-rejected.
+    model_used = bool(comparison.get("source") != "signal_pipeline")
+
     peak_support_count = int(hr_window_consensus.get("dominant_cluster_size", 0))
-    _soft_penalty = 0.0  # accumulated confidence penalty for soft issues
-    if has_min_signal:
-        _gate_std_dev = float(hr_window_consensus.get("std_dev", 0.0))
-        _gate_valid_windows = int(hr_window_consensus.get("valid_window_count", valid_windows))
-
-        # --- Hard fail: truly unusable (extreme noise or no signal) ---
-        if _gate_std_dev > 15.0:
-            rejection_reason = (
-                f"HR variability extremely high (std_dev={_gate_std_dev:.1f} bpm > 15.0 bpm). "
-                "Please hold very still with steady lighting."
-            )
-            has_min_signal = False
-        elif signal_strength < 0.08:
-            rejection_reason = (
-                f"rPPG signal not detected (signal_strength={signal_strength:.2f} < 0.08). "
-                "Ensure good lighting and keep your face centred in frame."
-            )
-            has_min_signal = False
-        else:
-            # --- Soft penalties: degrade confidence but keep the HR ---
-            if _gate_std_dev > 8.0:
-                _soft_penalty += 0.20
-                warning = "High HR variability — result may be less accurate."
-            if _gate_valid_windows < 3:
-                _soft_penalty += 0.15
-            if peak_support_count < 2:
-                _soft_penalty += 0.10
-            if signal_strength < 0.30:
-                _soft_penalty += 0.15
-
-    if not has_min_signal:
+    mean_brightness = float(np.mean(brightness_scores)) if brightness_scores else 0.5
+    mean_overexposure = float(np.mean(overexposure_ratios)) if overexposure_ratios else 0.0
+    tier_eval = _evaluate_hr_result_tier(
+        bpm=bpm,
+        periodicity=periodicity,
+        signal_strength=signal_strength,
+        valid_windows=valid_windows,
+        std_dev=std_dev,
+        peak_support_count=peak_support_count,
+        selected_roi=selected_roi,
+        timing_diag=timing_diag,
+        avg_motion=avg_motion,
+        mean_brightness=mean_brightness,
+        mean_overexposure=mean_overexposure,
+    )
+    hr_result_tier = str(tier_eval.get("tier", "result_unavailable"))
+    result_available = bool(tier_eval.get("result_available", False))
+    estimated_from_weak_signal = bool(tier_eval.get("estimated_from_weak_signal", False))
+    has_min_signal = result_available
+    rejection_codes = list(tier_eval.get("reasons", []))
+    _soft_penalty = 0.0
+    if result_available and not estimated_from_weak_signal:
+        if std_dev > 9.0:
+            _soft_penalty += 0.12
+        if valid_windows < 4:
+            _soft_penalty += 0.10
+    elif result_available and estimated_from_weak_signal:
+        _soft_penalty += 0.22
+        warning = "Estimated from weak signal. Retake recommended."
+    else:
         risk = "unreliable"
-        if rejection_reason:
-            message = rejection_reason
-        else:
-            message = (
-                "Unable to estimate heart rate: no usable pulse signal was detected "
-                "in this scan. Please retry with steady posture and better lighting."
-            )
+        if not rejection_codes:
+            rejection_codes.append("insufficient_signal")
+        message = (
+            "Unable to estimate heart rate: signal evidence is insufficient. "
+            "Please retry with steadier posture and more even lighting."
+        )
         heart_rate = None
         hr_confidence = 0.0
         retake_required = True
@@ -827,7 +1228,7 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
             retake_reasons.append(
                 "Could not detect a measurable pulse signal. Ensure your face is well lit and stable."
             )
-    else:
+    if has_min_signal:
         bpm = float(np.clip(bpm, 35.0, 220.0))
         risk, message = _classify_hr(bpm)
         heart_rate = round(bpm, 1)
@@ -835,18 +1236,23 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
         peak_quality_factor = float(hr_window_consensus.get("peak_quality_score", 0.0))
         cluster_tightness = float(hr_window_consensus.get("cluster_tightness", 0.0))
         run_delta = None
-        # Always apply cross-run EMA for cross-scan stability.
-        # Previously, EMA was skipped when consensus failed, letting the raw
-        # competition-engine BPM fluctuate between harmonics (e.g. 85/73/49).
         heart_rate, run_delta = _apply_cross_run_smoothing(float(heart_rate), channel="file")
         bpm = heart_rate
         valid_window_ratio = float(np.clip(valid_windows / 8.0, 0.0, 1.0))
+        if periodicity <= 0.0:
+            periodicity_effect = 0.15
+            confidence_cap_due_to_periodicity = 0.5
+            confidence_caps_applied.append("periodicity_zero_cap_0.50")
+        else:
+            periodicity_effect = max(periodicity, 0.2)
+            confidence_cap_due_to_periodicity = 1.0
         hr_confidence = (
-            0.25 * signal_strength
-            + 0.25 * peak_quality_factor
-            + 0.20 * snr_factor
-            + 0.15 * cluster_tightness
-            + 0.15 * valid_window_ratio
+            0.23 * signal_strength
+            + 0.23 * peak_quality_factor
+            + 0.18 * snr_factor
+            + 0.14 * cluster_tightness
+            + 0.12 * valid_window_ratio
+            + 0.10 * periodicity_effect
         )
         # Cross-run consistency adjustment
         if run_delta is not None:
@@ -854,7 +1260,7 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
                 hr_confidence = min(1.0, hr_confidence + 0.05)
             elif run_delta >= 8.0:
                 hr_confidence = max(0.0, hr_confidence - 0.05)
-        # Apply soft penalties from validation gate
+        # Apply tier-based penalty.
         hr_confidence = max(0.0, hr_confidence - _soft_penalty)
         # Clamp based on signal strength
         if signal_strength < 0.25:
@@ -870,10 +1276,22 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
             hr_confidence = min(1.0, hr_confidence + 0.06)
         if dominant_ratio >= 0.70:
             hr_confidence = min(1.0, hr_confidence + 0.05)
+        if std_dev < 12.0 and dominant_ratio > 0.30:
+            hr_confidence = min(1.0, hr_confidence + 0.10)
         hr_confidence = float(np.clip(hr_confidence, 0.0, 1.0))
+        hr_confidence = min(hr_confidence, confidence_cap_due_to_periodicity)
 
-        # Weak-but-real signals are returned with low confidence, never suppressed.
-        if bool(hr_window_consensus.get("unstable", False)):
+        # Usable scans should not collapse to near-zero confidence.
+        if not estimated_from_weak_signal and valid_windows >= 4 and periodicity >= 0.40:
+            hr_confidence = max(hr_confidence, 0.55)
+
+        # Tier-aware confidence shaping.
+        if estimated_from_weak_signal:
+            hr_confidence = float(np.clip(hr_confidence, 0.10, 0.38))
+            retake_required = True
+            if "Low confidence" not in " ".join(retake_reasons):
+                retake_reasons.append("Low confidence estimated result; retake recommended.")
+        elif bool(hr_window_consensus.get("unstable", False)):
             hr_confidence = float(np.clip(hr_confidence, 0.10, 0.30))
             warning = "High variability detected - result may not be reliable."
         elif periodicity < 0.30 or valid_windows < 4:
@@ -885,18 +1303,14 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
                 "Use a longer recording for higher stability."
             )
 
-        if _recovery_succeeded:
-            hr_confidence = round(min(hr_confidence, 0.75), 3)
-            method = _recovery_result.get("extraction_method_used", "multi-strategy")
-            roi = _recovery_result.get("roi_used", "best")
-            message += f" (Recovered via {method} on {roi} ROI.)"
-
     reliability = _derive_reliability(
         confidence=hr_confidence,
         periodicity=periodicity,
         valid_windows=valid_windows,
         has_signal=has_min_signal,
     )
+    if estimated_from_weak_signal and has_min_signal:
+        reliability = "low"
     if reliability == "low" and warning is None and heart_rate is not None:
         warning = "Low confidence result: estimated from weak signal."
 
@@ -914,6 +1328,89 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
         retake_required = True
         if "low confidence" not in " ".join(retake_reasons).lower():
             retake_reasons.append("Low confidence result from weak signal; retake for better accuracy.")
+
+    # Availability-first override: stable, high-window scans should always surface BPM.
+    usable_scan_override = valid_windows >= 6 and median_hr is not None
+    severe_motion_or_no_face = avg_motion > _MOTION_REJECT_THRESHOLD or face_detected_count <= 0
+
+    if valid_windows >= 6:
+        hr_result_tier = "result_available"
+        if not severe_motion_or_no_face:
+            retake_required = False
+
+    if usable_scan_override:
+        result_available = True
+        has_min_signal = True
+        estimated_from_weak_signal = False
+        if heart_rate is None:
+            heart_rate = round(float(median_hr), 1)
+        hr_confidence = max(float(hr_confidence), 0.55)
+        reliability = "medium"
+        warning = None
+        rejection_codes = []
+        if not severe_motion_or_no_face:
+            retake_required = False
+            retake_reasons = [
+                r for r in retake_reasons
+                if "low confidence" not in str(r).lower()
+                and "retake" not in str(r).lower()
+            ]
+
+    # For low-window but usable scans, apply only mild confidence penalty.
+    if has_min_signal and valid_windows < 6:
+        hr_confidence = float(np.clip(hr_confidence * 0.85, 0.10, 1.0))
+        confidence_caps_applied.append("low_window_penalty_x0.85")
+        if not severe_motion_or_no_face:
+            result_available = True
+            hr_result_tier = "result_available"
+            estimated_from_weak_signal = False
+            retake_required = False
+            retake_reasons = [
+                r for r in retake_reasons
+                if "low confidence" not in str(r).lower()
+                and "retake" not in str(r).lower()
+            ]
+
+    # Empty/unsupported classical evidence should reduce trust, not block availability.
+    no_classical_support = (
+        len(hr_result.get("all_candidate_scores", [])) == 0 or float(roi_agreement) == 0.0
+    )
+    if no_classical_support and has_min_signal:
+        hr_confidence = float(np.clip(hr_confidence * 0.85, 0.10, 1.0))
+        confidence_caps_applied.append("no_classical_support_penalty_x0.85")
+        if "no_classical_support" not in rejection_codes:
+            rejection_codes.append("no_classical_support")
+
+    # Hard signal reality gating: availability is kept, trust is downgraded.
+    signal_invalid = (
+        periodicity < 0.1
+        and signal_strength < 0.25
+        and float(roi_agreement) == 0.0
+    )
+
+    if model_used and signal_invalid and has_min_signal:
+        hr_confidence = float(np.clip(hr_confidence * 0.8, 0.10, 1.0))
+        confidence_caps_applied.append("model_on_invalid_penalty_x0.80")
+    if model_used and periodicity <= 0.0 and has_min_signal:
+        hr_confidence = min(hr_confidence, 0.5)
+        confidence_caps_applied.append("model_periodicity_zero_cap_0.50")
+
+    if signal_invalid:
+        if heart_rate is None:
+            if median_hr is not None:
+                heart_rate = round(float(median_hr), 1)
+            elif bpm is not None and float(bpm) > 0:
+                heart_rate = round(float(bpm), 1)
+        result_available = True
+        if valid_windows >= 6:
+            hr_result_tier = "result_available"
+        estimated_from_weak_signal = True
+        reliability = "low"
+        hr_confidence = min(float(hr_confidence), 0.45)
+        confidence_caps_applied.append("signal_invalid_cap_0.45")
+        warning = "Very weak physiological signal. Estimate may be unreliable."
+        if "no_signal_structure" not in rejection_codes:
+            rejection_codes.append("no_signal_structure")
 
     # --- 2. Blink ---
     blink_results = aggregate_blink_results(
@@ -957,6 +1454,18 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
     debug_info["heart_rate_range"] = [hr_min, hr_max] if hr_min is not None and hr_max is not None else None
     debug_info["stability"] = stability
     debug_info["final_method_used"] = method_used
+    debug_info["final_acceptance_reason"] = (
+        f"{hr_result_tier}: periodicity={periodicity:.3f}, valid_windows={valid_windows}, signal_strength={signal_strength:.3f}"
+        if has_min_signal
+        else f"result_unavailable: reasons={','.join(rejection_codes)}"
+    )
+    debug_info["hr_result_tier"] = hr_result_tier
+    debug_info["result_available"] = result_available
+    debug_info["estimated_from_weak_signal"] = estimated_from_weak_signal
+    debug_info["signal_invalid"] = signal_invalid
+    debug_info["model_used"] = model_used
+    debug_info["confidence_caps_applied"] = confidence_caps_applied
+    debug_info["hr_rejection_codes"] = rejection_codes
     debug_info["suppression_reason"] = suppression_reason
     debug_info["rejection_reason"] = rejection_reason
     debug_info["peak_support_count"] = peak_support_count
@@ -971,6 +1480,14 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
     debug_info["roi_skin_coverage"] = {k: round(v, 3) for k, v in roi_skin_cov.items()}
     if roi_drift_scores:
         debug_info["mean_roi_drift"] = round(float(np.mean(roi_drift_scores)), 3)
+
+    cap_suffix = " (capped)" if confidence_caps_applied else ""
+    print(
+        f"[SCAN SUMMARY] fps={analysis_fps:.2f}, effective_fps={debug_info.get('effective_fps', analysis_fps):.2f}, "
+        f"windows={valid_windows}, periodicity={periodicity:.3f}, signal={signal_strength:.3f}, "
+        f"signal_invalid={signal_invalid}, model={comparison.get('model_name', 'none')}, "
+        f"bpm={median_hr}, confidence={hr_confidence:.2f}{cap_suffix}, caps={confidence_caps_applied}"
+    )
 
     return {
         # --- Primary fields ---
@@ -998,11 +1515,16 @@ def analyze_face_video(video_path: str) -> Dict[str, Any]:
         "confidence": hr_confidence,
         "hr_confidence": hr_confidence,
         "reliability": reliability,
+        "hr_result_tier": hr_result_tier,
+        "result_available": result_available,
+        "retake_recommended": retake_required,
+        "estimated_from_weak_signal": estimated_from_weak_signal,
         "signal_strength": round(signal_strength, 3),
         "periodicity_score": round(periodicity, 3),
         "valid_windows": valid_windows,
         "method_used": method_used,
         "warning": warning,
+        "hr_rejection_reasons": rejection_codes,
         "confidence_breakdown": confidence_breakdown,
 
         # Risk & message
@@ -1086,6 +1608,7 @@ class FaceStreamProcessor:
 
         # Rolling buffers (same accumulators as analyze_face_video)
         self._roi_traces: Dict[str, List[float]] = {name: [] for name in ROI_NAMES}
+        self._roi_timestamps: Dict[str, List[float]] = {name: [] for name in ROI_NAMES}
         self._roi_rgb_traces: Dict[str, List[np.ndarray]] = {name: [] for name in ROI_NAMES}
         self._roi_overexposure: Dict[str, List[float]] = {name: [] for name in ROI_NAMES}
         self._ear_values: List[float] = []
@@ -1098,9 +1621,15 @@ class FaceStreamProcessor:
         self._motion_magnitudes: List[float] = []
         self._brightness_scores: List[float] = []
         self._overexposure_ratios: List[float] = []
+        self._blur_scores: List[float] = []
+        self._valid_timestamps: List[float] = []
         self._blink_detector = BlinkDetector()
         self._prev_anchors: Optional[np.ndarray] = None
         self._overexposed_reject_count = 0
+        self._low_brightness_reject_count = 0
+        self._blur_reject_count = 0
+        self._motion_reject_count = 0
+        self._roi_instability_reject_count = 0
         self._roi_skin_quality: Dict[str, List[float]] = {name: [] for name in ROI_NAMES}
         self._roi_drift_scores: List[float] = []
         self._landmark_smoother = LandmarkSmoother(alpha=0.6)
@@ -1143,7 +1672,7 @@ class FaceStreamProcessor:
             self._haar_cascade = cv2.CascadeClassifier(cascade_path)
 
     # ------------------------------------------------------------------
-    def push_frame(self, frame: np.ndarray) -> Optional[Dict[str, Any]]:
+    def push_frame(self, frame: np.ndarray, timestamp_sec: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """Feed one BGR frame into the processor.
 
         Returns an ``"interim"`` event dict every
@@ -1164,6 +1693,9 @@ class FaceStreamProcessor:
         # Overexposure + denoise + CLAHE + gamma
         oe = frame_overexposure_ratio(frame)
         self._overexposure_ratios.append(oe)
+        blur_meta = frame_blur_metrics(frame)
+        blur_q = float(blur_meta.get("blur_quality", 0.0))
+        self._blur_scores.append(blur_q)
         frame = denoise_frame(frame)
         frame = apply_clahe(frame)
         frame = gamma_correct(frame, bright)
@@ -1196,60 +1728,66 @@ class FaceStreamProcessor:
                 self._motion_magnitudes.append(motion_mag)
 
                 fq = bq * (1.0 / (1.0 + motion_mag * 0.5))
+                drift_penalty = float(np.clip(1.0 / (1.0 + max(drift, 0.0) * 0.08), 0.0, 1.0))
+                fq = fq * blur_q * drift_penalty
                 self._frame_qualities.append(fq)
 
-                if motion_mag <= _MOTION_REJECT_THRESHOLD:
-                    if oe > 0.50:
-                        self._overexposed_reject_count += 1
-                    else:
-                        self._valid_frame_count += 1
+                if bq < _LOW_BRIGHTNESS_MIN_QUALITY:
+                    self._low_brightness_reject_count += 1
+                elif blur_q < _BLUR_MIN_QUALITY:
+                    self._blur_reject_count += 1
+                elif drift > _ROI_DRIFT_REJECT_PX:
+                    self._roi_instability_reject_count += 1
+                elif motion_mag > _MOTION_REJECT_THRESHOLD:
+                    self._motion_reject_count += 1
+                elif oe > _FRAME_OVEREXPOSURE_REJECT:
+                    self._overexposed_reject_count += 1
+                else:
+                    self._valid_frame_count += 1
 
-                        if len(self._model_frames) < _STREAM_MAX_BUFFER:
-                            self._model_frames.append(frame.copy())
+                    if len(self._model_frames) < _STREAM_MAX_BUFFER:
+                        self._model_frames.append(frame.copy())
 
-                        roi_vals = extract_frame_roi_signals(frame, lm_list, h, w)
-                        for name in ROI_NAMES:
-                            v = roi_vals.get(name)
-                            if v is not None:
-                                self._roi_traces[name].append(v)
+                    curr_ts = (
+                        float(timestamp_sec)
+                        if timestamp_sec is not None
+                        else float(self._frame_count / max(self._fps, 1e-6))
+                    )
+                    self._valid_timestamps.append(curr_ts)
 
-                        roi_rgb = extract_frame_roi_rgb(frame, lm_list, h, w)
-                        for name in ROI_NAMES:
-                            v = roi_rgb.get(name)
-                            if v is not None:
-                                self._roi_rgb_traces[name].append(v)
+                    roi_vals = extract_frame_roi_signals(frame, lm_list, h, w)
+                    for name in ROI_NAMES:
+                        v = roi_vals.get(name)
+                        if v is not None:
+                            self._roi_traces[name].append(v)
+                            self._roi_timestamps[name].append(curr_ts)
 
-                        roi_oe = extract_frame_overexposure(frame, lm_list, h, w)
-                        for name in ROI_NAMES:
-                            self._roi_overexposure[name].append(roi_oe.get(name, 0.0))
+                    roi_rgb = extract_frame_roi_rgb(frame, lm_list, h, w)
+                    for name in ROI_NAMES:
+                        v = roi_rgb.get(name)
+                        if v is not None:
+                            self._roi_rgb_traces[name].append(v)
 
-                        # Sample ROI skin quality every 5th valid frame
-                        if self._valid_frame_count % 5 == 0:
-                            _skin_mask = build_skin_mask(frame)
-                            _roi_funcs = {
-                                "forehead": extract_forehead_roi,
-                                "left_cheek": extract_cheek_roi,
-                                "right_cheek": extract_cheek_roi,
-                            }
-                            for _rname in ROI_NAMES:
-                                _rfn = _roi_funcs.get(_rname)
-                                if _rfn is None:
-                                    continue
-                                try:
-                                    if _rname == "right_cheek":
-                                        _roi_patch = _rfn(frame, lm_list, h, w, side="right")
-                                    elif _rname == "left_cheek":
-                                        _roi_patch = _rfn(frame, lm_list, h, w, side="left")
-                                    else:
-                                        _roi_patch = _rfn(frame, lm_list, h, w)
-                                    if _roi_patch is not None and _roi_patch.size > 0:
-                                        _rmask = _skin_mask[
-                                            :_roi_patch.shape[0], :_roi_patch.shape[1]
-                                        ] if _skin_mask is not None else None
-                                        _qm = compute_roi_quality_metrics(_roi_patch, _rmask)
-                                        self._roi_skin_quality[_rname].append(_qm["quality_score"])
-                                except Exception:
-                                    pass
+                    roi_oe = extract_frame_overexposure(frame, lm_list, h, w)
+                    for name in ROI_NAMES:
+                        self._roi_overexposure[name].append(roi_oe.get(name, 0.0))
+
+                    # Sample ROI skin quality every 5th valid frame
+                    if self._valid_frame_count % 5 == 0:
+                        fh_roi = extract_forehead_roi(frame, lm_list, h, w)
+                        if fh_roi is not None and fh_roi.size > 0:
+                            q = compute_roi_quality_metrics(fh_roi)
+                            self._roi_skin_quality["forehead"].append(q["quality_score"])
+
+                        lc = extract_cheek_roi(frame, lm_list, LEFT_CHEEK, h, w)
+                        if lc is not None:
+                            q = compute_roi_quality_metrics(lc[0], lc[1])
+                            self._roi_skin_quality["left_cheek"].append(q["quality_score"])
+
+                        rc = extract_cheek_roi(frame, lm_list, RIGHT_CHEEK, h, w)
+                        if rc is not None:
+                            q = compute_roi_quality_metrics(rc[0], rc[1])
+                            self._roi_skin_quality["right_cheek"].append(q["quality_score"])
 
                     ear = avg_ear(lm_list, h, w)
                     self._ear_values.append(round(ear, 4))
@@ -1314,6 +1852,7 @@ class FaceStreamProcessor:
                 self._roi_traces, roi_weights, self._fps, RPPG_LOW_HZ, RPPG_HIGH_HZ,
                 roi_rgb_traces=self._roi_rgb_traces,
                 roi_overexposure=self._roi_overexposure,
+                roi_timestamps=self._roi_timestamps,
             )
             return hr["bpm"], hr["quality"]
         except Exception:
@@ -1357,19 +1896,36 @@ class FaceStreamProcessor:
         """Mirror the post-processing block of analyze_face_video."""
         duration_sec = self._frame_count / self._fps
 
-        if self._frame_count < FACE_MIN_FRAMES or self._valid_frame_count < FACE_MIN_FRAMES:
-            return _build_error_result(
+        _MIN_STREAM_VALID_FRAMES = max(FACE_MIN_FRAMES // 3, 10)
+        if self._frame_count < FACE_MIN_FRAMES or self._valid_frame_count < _MIN_STREAM_VALID_FRAMES:
+            return _emit_result(_build_error_result(
                 "Not enough valid frames captured for a reliable estimate.",
                 {"frames": self._frame_count, "valid": self._valid_frame_count},
-            )
-        _MIN_USABLE_FRAMES = max(FACE_MIN_FRAMES // 2, 15)
+            ), source="stream")
+        timing_diag = _compute_timing_diagnostics(self._valid_timestamps, self._fps)
+        _MIN_USABLE_FRAMES = max(FACE_MIN_FRAMES // 3, 10)
         if self._valid_frame_count < _MIN_USABLE_FRAMES:
-            return _build_error_result(
+            return _emit_result(_build_error_result(
                 f"Too few usable frames ({self._valid_frame_count}) after filtering "
                 f"motion and overexposure. Need at least {_MIN_USABLE_FRAMES}. "
                 "Please rescan in stable lighting and keep your head still.",
                 {"frames": self._frame_count, "valid": self._valid_frame_count},
-            )
+            ), source="stream")
+        min_temporal_coverage = max(
+            _MIN_TEMPORAL_COVERAGE_SEC,
+            min(_MAX_TEMPORAL_COVERAGE_SEC, duration_sec * _TEMPORAL_COVERAGE_RATIO),
+        )
+        if float(timing_diag.get("coverage_sec", 0.0)) < min_temporal_coverage:
+            return _emit_result(_build_error_result(
+                "Insufficient temporal coverage after frame-quality filtering. "
+                "Please hold still for longer under steady lighting.",
+                {
+                    "frames": self._frame_count,
+                    "valid": self._valid_frame_count,
+                    "timing": timing_diag,
+                    "required_coverage_sec": round(min_temporal_coverage, 2),
+                },
+            ), source="stream")
 
         # HR
         roi_weights = {n: (1.5 if n == "forehead" else 1.0) for n in ROI_NAMES}
@@ -1383,6 +1939,7 @@ class FaceStreamProcessor:
             roi_rgb_traces=self._roi_rgb_traces,
             roi_overexposure=self._roi_overexposure,
             roi_skin_coverage=_roi_skin_cov,
+            roi_timestamps=self._roi_timestamps,
         )
         bpm = hr_result["bpm"]
         hr_quality = hr_result["quality"]
@@ -1391,6 +1948,12 @@ class FaceStreamProcessor:
         _comp_signal_strength = float(hr_result.get("signal_strength", 0.0))
         _selected_roi = hr_result.get("selected_roi")
         _selected_method = hr_result.get("selected_method")
+        _roi_adaptive_weights = hr_result.get("roi_adaptive_weights", {})
+        _method_adaptive_weights = hr_result.get("method_adaptive_weights", {})
+        _candidate_rejections = hr_result.get("candidate_rejections", [])
+        _resampled_candidate_count = int(hr_result.get("resampled_candidate_count", 0))
+        _resampled_candidate_ratio = float(hr_result.get("resampled_candidate_ratio", 0.0))
+        _candidate_effective_fps = hr_result.get("effective_fps_summary", {})
 
         # Optional model inference
         model_result = infer_rppg_models(self._model_frames, self._fps)
@@ -1420,26 +1983,10 @@ class FaceStreamProcessor:
         retake_reasons = quality_result["retake_reasons"]
         confidence_breakdown = quality_result["confidence_breakdown"]
 
-        # ── Recovery mode (streaming path) ──────────────────────────────
-        _RECOVERY_TRIGGER_PERIOD = 0.18
-        _stream_recovery: Optional[Dict[str, Any]] = None
-        _stream_recovery_triggered = (
-            bpm is None or bpm <= 0
-            or hr_quality < 0.05
-            or periodicity < _RECOVERY_TRIGGER_PERIOD
-        )
-        if _stream_recovery_triggered and self._valid_frame_count >= 20:
-            _stream_recovery = recover_heart_rate(
-                self._roi_traces, self._roi_rgb_traces, self._fps,
-                RPPG_LOW_HZ, RPPG_HIGH_HZ,
-            )
-            if _stream_recovery["recovery_success"]:
-                bpm = _stream_recovery["bpm"]
-                hr_quality = _stream_recovery["quality"]
-                periodicity = _stream_recovery["periodicity"]
-        _stream_recovery_succeeded = (
-            _stream_recovery is not None and _stream_recovery["recovery_success"]
-        )
+        # Recovery fallback is intentionally disabled in final scoring paths.
+        _stream_recovery_triggered = False
+        _stream_recovery_succeeded = False
+        _stream_recovery = None
 
         best_roi = max(self._roi_traces, key=lambda k: len(self._roi_traces[k]))
         averaged_trace = _build_spatially_averaged_trace(self._roi_traces)
@@ -1471,36 +2018,51 @@ class FaceStreamProcessor:
         std_dev = float(hr_window_consensus.get("std_dev", 0.0))
         stability = _stability_label(std_dev)
 
-        _MIN_SIGNAL_PERIODICITY = 0.20
-        _MIN_WEAK_WINDOWS = 2
-        windows_from_recovery = int((_stream_recovery or {}).get("windows_accepted", 0))
-        valid_windows = max(int(hr_window_consensus.get("valid_window_count", 0)), windows_from_recovery)
-        method_used = (
-            (_stream_recovery or {}).get("extraction_method_used", "multi_roi_primary")
-            if _stream_recovery_succeeded else "multi_roi_primary"
-        )
+        valid_windows = int(hr_window_consensus.get("valid_window_count", 0))
+        method_used = "multi_roi_primary"
         if hr_window_consensus.get("has_consensus"):
             method_used = f"window_consensus_{hr_window_consensus.get('method', 'median')}"
-        has_min_signal = (
-            bpm is not None
-            and bpm > 0
-            and (
-                periodicity >= _MIN_SIGNAL_PERIODICITY
-                or valid_windows >= _MIN_WEAK_WINDOWS
-            )
-        )
         signal_strength = (
             float(np.clip(_comp_signal_strength, 0.0, 1.0))
             if _comp_signal_strength > 0.0
             else float(np.clip(0.6 * max(hr_quality, 0.0) + 0.4 * max(periodicity, 0.0), 0.0, 1.0))
         )
+        peak_support_count = int(hr_window_consensus.get("dominant_cluster_size", 0))
+        avg_motion = float(np.mean(self._motion_magnitudes)) if self._motion_magnitudes else 0.0
+        mean_brightness = float(np.mean(self._brightness_scores)) if self._brightness_scores else 0.5
+        mean_overexposure = float(np.mean(self._overexposure_ratios)) if self._overexposure_ratios else 0.0
+        tier_eval = _evaluate_hr_result_tier(
+            bpm=bpm,
+            periodicity=periodicity,
+            signal_strength=signal_strength,
+            valid_windows=valid_windows,
+            std_dev=std_dev,
+            peak_support_count=peak_support_count,
+            selected_roi=_selected_roi,
+            timing_diag=timing_diag,
+            avg_motion=avg_motion,
+            mean_brightness=mean_brightness,
+            mean_overexposure=mean_overexposure,
+        )
+        hr_result_tier = str(tier_eval.get("tier", "result_unavailable"))
+        result_available = bool(tier_eval.get("result_available", False))
+        estimated_from_weak_signal = bool(tier_eval.get("estimated_from_weak_signal", False))
+        has_min_signal = result_available
+        rejection_codes: List[str] = list(tier_eval.get("reasons", []))
         warning: Optional[str] = None
+        _soft_penalty = 0.0
+        if result_available and not estimated_from_weak_signal:
+            if std_dev > 9.0:
+                _soft_penalty += 0.10
+        elif result_available and estimated_from_weak_signal:
+            _soft_penalty += 0.20
+            warning = "Estimated from weak signal. Retake recommended."
 
         if not has_min_signal:
             risk = "unreliable"
             message = (
-                "Unable to estimate heart rate: no usable pulse signal was detected "
-                "in this scan. Please retry with steady posture and better lighting."
+                "Unable to estimate heart rate: signal evidence is insufficient. "
+                "Please retry with steadier posture and better lighting."
             )
             heart_rate = None
             hr_confidence = 0.0
@@ -1521,9 +2083,8 @@ class FaceStreamProcessor:
             peak_quality_factor = float(hr_window_consensus.get("peak_quality_score", 0.0))
             cluster_tightness = float(hr_window_consensus.get("cluster_tightness", 0.0))
             run_delta = None
-            if hr_window_consensus.get("has_consensus"):
-                heart_rate, run_delta = _apply_cross_run_smoothing(float(heart_rate), channel="stream")
-                bpm = heart_rate
+            heart_rate, run_delta = _apply_cross_run_smoothing(float(heart_rate), channel="stream")
+            bpm = heart_rate
             base_conf = (
                 0.10 * tracking_ratio
                 + 0.08 * roi_agreement
@@ -1552,13 +2113,19 @@ class FaceStreamProcessor:
                     hr_confidence = min(1.0, hr_confidence + 0.08)
                 elif run_delta >= 8.0:
                     hr_confidence = max(0.0, hr_confidence - 0.08)
+            hr_confidence = max(0.0, hr_confidence - _soft_penalty)
             dominant_ratio = float(hr_window_consensus.get("dominant_cluster_ratio", 0.0))
             if std_dev < 3.0:
                 hr_confidence = min(1.0, hr_confidence + 0.06)
             if dominant_ratio >= 0.70:
                 hr_confidence = min(1.0, hr_confidence + 0.05)
             hr_confidence = float(np.clip(hr_confidence, 0.0, 1.0))
-            if bool(hr_window_consensus.get("unstable", False)):
+            if estimated_from_weak_signal:
+                hr_confidence = float(np.clip(hr_confidence, 0.10, 0.38))
+                retake_required = True
+                if "Low confidence" not in " ".join(retake_reasons):
+                    retake_reasons.append("Low confidence estimated result; retake recommended.")
+            elif bool(hr_window_consensus.get("unstable", False)):
                 hr_confidence = float(np.clip(hr_confidence, 0.10, 0.30))
                 warning = "High variability detected - result may not be reliable."
             elif periodicity < 0.30 or valid_windows < 4:
@@ -1569,10 +2136,6 @@ class FaceStreamProcessor:
                     "Window count is limited for weak signal. "
                     "Use a longer recording for higher stability."
                 )
-            if _stream_recovery_succeeded:
-                hr_confidence = round(min(hr_confidence, 0.75), 3)
-                method = _stream_recovery.get("extraction_method_used", "multi-strategy")
-                message += f" (Recovered via {method}.)"
 
         reliability = _derive_reliability(
             confidence=hr_confidence,
@@ -1580,6 +2143,8 @@ class FaceStreamProcessor:
             valid_windows=valid_windows,
             has_signal=has_min_signal,
         )
+        if estimated_from_weak_signal and has_min_signal:
+            reliability = "low"
         if reliability == "low" and warning is None and heart_rate is not None:
             warning = "Low confidence result: estimated from weak signal."
         if heart_rate is not None:
@@ -1599,7 +2164,7 @@ class FaceStreamProcessor:
         eye_color = aggregate_eye_color(self._eye_color_samples)
         skin_analysis = aggregate_skin_analysis(self._skin_samples)
 
-        return {
+        return _emit_result({
             "module_name": "face_module",
             "scan_duration_sec": round(duration_sec, 2),
             "heart_rate": heart_rate,
@@ -1622,21 +2187,35 @@ class FaceStreamProcessor:
             "confidence": hr_confidence,
             "hr_confidence": hr_confidence,
             "reliability": reliability,
+            "hr_result_tier": hr_result_tier,
+            "result_available": result_available,
+            "retake_recommended": retake_required,
+            "estimated_from_weak_signal": estimated_from_weak_signal,
             "signal_strength": round(signal_strength, 3),
             "periodicity_score": round(periodicity, 3),
             "valid_windows": valid_windows,
             "method_used": method_used,
             "warning": warning,
+            "hr_rejection_reasons": rejection_codes,
             "confidence_breakdown": confidence_breakdown,
             "risk": risk,
             "message": message,
             "debug": {
                 "frames_processed": self._frame_count,
                 "valid_frames": self._valid_frame_count,
+                "dropped_frames": max(self._frame_count - self._valid_frame_count, 0),
                 "fps": round(self._fps, 1),
                 "duration_sec": round(duration_sec, 2),
+                "timing": timing_diag,
+                "effective_fps": timing_diag.get("effective_fps"),
+                "cadence_jitter_cv": timing_diag.get("cadence_jitter_cv"),
                 "suppression_reason": suppression_reason,
                 "usable_frame_count": self._valid_frame_count,
+                "overexposed_reject_count": self._overexposed_reject_count,
+                "low_brightness_reject_count": self._low_brightness_reject_count,
+                "blur_reject_count": self._blur_reject_count,
+                "motion_reject_count": self._motion_reject_count,
+                "roi_instability_reject_count": self._roi_instability_reject_count,
                 "signal_strength": round(signal_strength, 3),
                 "periodicity_score": round(periodicity, 3),
                 "valid_windows": valid_windows,
@@ -1655,10 +2234,24 @@ class FaceStreamProcessor:
                 "heart_rate_range": [hr_min, hr_max] if hr_min is not None and hr_max is not None else None,
                 "stability": stability,
                 "final_method_used": method_used,
+                "roi_adaptive_weights": _roi_adaptive_weights,
+                "method_adaptive_weights": _method_adaptive_weights,
+                "candidate_rejections": _candidate_rejections,
+                "resampled_candidate_count": _resampled_candidate_count,
+                "resampled_candidate_ratio": round(_resampled_candidate_ratio, 4),
+                "candidate_effective_fps": _candidate_effective_fps,
                 "recovery_triggered": _stream_recovery_triggered,
                 "recovery_success": _stream_recovery_succeeded,
                 "recovery": {k: v for k, v in _stream_recovery.items() if k != "attempt_log"}
                     if _stream_recovery else None,
+                "hr_rejection_codes": rejection_codes,
+                "final_acceptance_reason": (
+                    f"{hr_result_tier}: periodicity={periodicity:.3f}, valid_windows={valid_windows}, signal_strength={signal_strength:.3f}"
+                    if has_min_signal else f"result_unavailable: reasons={','.join(rejection_codes)}"
+                ),
+                "hr_result_tier": hr_result_tier,
+                "result_available": result_available,
+                "estimated_from_weak_signal": estimated_from_weak_signal,
                 "rppg_model": {
                     "model_used": comparison.get("model_name", "none"),
                     "source": comparison.get("source", "signal_pipeline"),
@@ -1682,7 +2275,7 @@ class FaceStreamProcessor:
             "metric_name": "heart_rate",
             "value": heart_rate,
             "unit": "bpm",
-        }
+        }, source="stream")
 
     # ------------------------------------------------------------------
     def finalise(self) -> Dict[str, Any]:

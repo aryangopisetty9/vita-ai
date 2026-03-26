@@ -1,25 +1,24 @@
 import 'dart:convert';
-import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
 import 'api_exception.dart';
+import 'app_config.dart';
 import 'upload_helper.dart' as uploader;
 export 'api_exception.dart';
 
 /// Central API service that connects Flutter to the Vita AI FastAPI backend.
 ///
-/// The base URL is chosen automatically:
-/// - Web (Chrome): http://localhost:8000
-/// - Android emulator: http://10.0.2.2:8000
-/// - Desktop / other: http://127.0.0.1:8000
+/// The base URL is configured in [AppConfig.baseUrl], preferably via
+/// --dart-define=VITA_BASE_URL for real-device testing.
 class ApiService {
   static String get baseUrl {
-    // When served from the backend (same origin), use relative URLs → no CORS.
-    if (kIsWeb) return '';
-    // Android emulator uses 10.0.2.2 to reach host machine's localhost
-    if (Platform.isAndroid) return 'http://10.0.2.2:8000';
-    return 'http://127.0.0.1:8000';
+    // Keep relative URLs for same-origin web deploys when baseUrl is ''.
+    if (kIsWeb && AppConfig.baseUrl.isEmpty) return '';
+    return AppConfig.baseUrl;
   }
+
+  static const Duration _requestTimeout = Duration(seconds: 60);
+  static const Duration _longProcessingTimeout = Duration(seconds: 120);
 
   // ── Token storage (in-memory; persists for the app session) ─────────────────
 
@@ -48,7 +47,7 @@ class ApiService {
       Uri.parse('$baseUrl/auth/signup'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({'name': name, 'email': email, 'password': password}),
-    );
+    ).timeout(_requestTimeout);
     if (resp.statusCode != 200 && resp.statusCode != 201) {
       throw ApiException(resp.statusCode, resp.body);
     }
@@ -61,7 +60,7 @@ class ApiService {
       Uri.parse('$baseUrl/auth/login'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({'email': email, 'password': password}),
-    );
+    ).timeout(_requestTimeout);
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
     final data = jsonDecode(resp.body) as Map<String, dynamic>;
     // Store JWT for use in subsequent authenticated requests
@@ -72,9 +71,40 @@ class ApiService {
 
   /// Get current authenticated user's profile (GET /auth/me)
   static Future<Map<String, dynamic>> getProfile() async {
-    final resp = await http.get(Uri.parse('$baseUrl/auth/me'), headers: _jsonHeaders);
+    final resp = await http
+      .get(Uri.parse('$baseUrl/auth/me'), headers: _jsonHeaders)
+      .timeout(_requestTimeout);
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
     return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  /// Update current authenticated user's profile.
+  static Future<Map<String, dynamic>> updateProfile({required String name}) async {
+    final resp = await http.put(
+      Uri.parse('$baseUrl/auth/me'),
+      headers: _jsonHeaders,
+      body: jsonEncode({'name': name}),
+    ).timeout(_requestTimeout);
+    if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  /// Change password for the current authenticated user.
+  static Future<void> changePassword({
+    required String currentPassword,
+    required String newPassword,
+    required String confirmPassword,
+  }) async {
+    final resp = await http.post(
+      Uri.parse('$baseUrl/auth/change-password'),
+      headers: _jsonHeaders,
+      body: jsonEncode({
+        'current_password': currentPassword,
+        'new_password': newPassword,
+        'confirm_password': confirmPassword,
+      }),
+    ).timeout(_requestTimeout);
+    if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
   }
 
   // ── Health check ─────────────────────────────────────────────────────
@@ -96,13 +126,87 @@ class ApiService {
   /// Uses dart:html FormData on web, http.MultipartRequest on native.
   static Future<Map<String, dynamic>> predictFace(
       List<int> fileBytes, String fileName) async {
+    return predictVideo(fileBytes, fileName);
+  }
+
+  /// Upload a recorded face video for heavy backend processing.
+  static Future<Map<String, dynamic>> predictVideo(
+      List<int> fileBytes, String fileName) async {
     return uploader.postFileMultipart(
-      '$baseUrl/predict/face',
+      '$baseUrl/predict/video',
       fileBytes,
       'file',
       fileName,
       mimeType: 'video/webm',
     );
+  }
+
+  /// Send lightweight live-scan signal payload for fast face estimation.
+  static Future<Map<String, dynamic>> predictFaceLiveSignal({
+    required List<double> signal,
+    required double durationSec,
+    required double samplingHz,
+    int? framesSeen,
+    int? framesProcessed,
+    int? framesSkipped,
+    double? brightnessMean,
+  }) async {
+    final resp = await http
+        .post(
+          Uri.parse('$baseUrl/predict/face-live'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'signal': signal,
+            'duration_sec': durationSec,
+            'sampling_hz': samplingHz,
+            'frames_seen': framesSeen,
+            'frames_processed': framesProcessed,
+            'frames_skipped': framesSkipped,
+            'brightness_mean': brightnessMean,
+          }),
+        )
+        .timeout(_longProcessingTimeout);
+    if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  /// Submit a live face scan processing job and return {job_id, status}.
+  static Future<Map<String, dynamic>> submitFaceLiveSignalJob({
+    required List<double> signal,
+    required double durationSec,
+    required double samplingHz,
+    int? framesSeen,
+    int? framesProcessed,
+    int? framesSkipped,
+    double? brightnessMean,
+  }) async {
+    final resp = await http
+        .post(
+          Uri.parse('$baseUrl/predict/face-live'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'signal': signal,
+            'duration_sec': durationSec,
+            'sampling_hz': samplingHz,
+            'frames_seen': framesSeen,
+            'frames_processed': framesProcessed,
+            'frames_skipped': framesSkipped,
+            'brightness_mean': brightnessMean,
+          }),
+        )
+        .timeout(_longProcessingTimeout);
+    if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  /// Poll status/result for a submitted live face processing job.
+  static Future<Map<String, dynamic>> getFaceLiveSignalJobStatus(
+      String jobId) async {
+    final resp = await http
+        .get(Uri.parse('$baseUrl/predict/face-live/job-status/$jobId'))
+        .timeout(_longProcessingTimeout);
+    if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
+    return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
   // ── Audio scan ───────────────────────────────────────────────────────
@@ -135,7 +239,7 @@ class ApiService {
       Uri.parse('$baseUrl/predict/symptom'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode(payload),
-    );
+    ).timeout(_requestTimeout);
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
@@ -155,7 +259,7 @@ class ApiService {
         'audio_result': audioResult,
         'symptom_result': symptomResult,
       }),
-    );
+    ).timeout(_requestTimeout);
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
@@ -168,14 +272,15 @@ class ApiService {
       Uri.parse('$baseUrl/user/$userId/health-data'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode(data),
-    );
+    ).timeout(_requestTimeout);
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
   static Future<Map<String, dynamic>?> getHealthData(int userId) async {
-    final resp =
-        await http.get(Uri.parse('$baseUrl/user/$userId/health-data'));
+    final resp = await http
+      .get(Uri.parse('$baseUrl/user/$userId/health-data'))
+      .timeout(_requestTimeout);
     if (resp.statusCode == 404) return null;
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
     return jsonDecode(resp.body) as Map<String, dynamic>;
@@ -189,7 +294,7 @@ class ApiService {
     final resp = await http.get(
       Uri.parse('$baseUrl/user/$userId/scans'),
       headers: _jsonHeaders,
-    );
+    ).timeout(_requestTimeout);
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
     return jsonDecode(resp.body) as List<dynamic>;
   }
@@ -201,7 +306,7 @@ class ApiService {
     final resp = await http.delete(
       Uri.parse('$baseUrl/user/$userId/scan/$scanId'),
       headers: _jsonHeaders,
-    );
+    ).timeout(_requestTimeout);
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
   }
 
@@ -215,7 +320,7 @@ class ApiService {
       Uri.parse('$baseUrl/user/$userId/scan?scan_type=$scanType'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode(result),
-    );
+    ).timeout(_requestTimeout);
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
@@ -236,7 +341,7 @@ class ApiService {
         'face_result': faceResult,
         'audio_result': audioResult,
       }),
-    );
+    ).timeout(_requestTimeout);
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
@@ -244,8 +349,9 @@ class ApiService {
   // ── SOS / Emergency Contacts (SOS feature integrated from Manogna) ───
 
   static Future<List<dynamic>> getSosContacts(int userId) async {
-    final resp =
-        await http.get(Uri.parse('$baseUrl/sos/contacts/$userId'));
+    final resp = await http
+      .get(Uri.parse('$baseUrl/sos/contacts/$userId'))
+      .timeout(_requestTimeout);
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
     return jsonDecode(resp.body) as List<dynamic>;
   }
@@ -260,14 +366,15 @@ class ApiService {
         'phone': phone,
         'relationship': relationship,
       }),
-    );
+    ).timeout(_requestTimeout);
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
   static Future<void> deleteSosContact(int userId, int contactId) async {
     final resp = await http
-        .delete(Uri.parse('$baseUrl/sos/contacts/$userId/$contactId'));
+      .delete(Uri.parse('$baseUrl/sos/contacts/$userId/$contactId'))
+      .timeout(_requestTimeout);
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
   }
 
@@ -281,7 +388,7 @@ class ApiService {
         'latitude': latitude,
         'longitude': longitude,
       }),
-    );
+    ).timeout(_requestTimeout);
     if (resp.statusCode != 200) throw ApiException(resp.statusCode, resp.body);
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }

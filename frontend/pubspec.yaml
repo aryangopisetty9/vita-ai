@@ -30,6 +30,9 @@ dependencies:
   # Open external links (from new UI)
   url_launcher: ^6.2.6
 
+  # Local persistence for app settings
+  shared_preferences: ^2.3.2
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

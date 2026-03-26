@@ -151,7 +151,12 @@ def chrom_project(rgb_traces: np.ndarray, fps: float) -> np.ndarray:
     return s
 
 
-def lgi_project(rgb_traces: np.ndarray, fps: float) -> np.ndarray:
+def lgi_project(
+    rgb_traces: np.ndarray,
+    fps: float,
+    low_hz: float = 0.7,
+    high_hz: float = 3.5,
+) -> np.ndarray:
     """LGI / PCA-based rPPG colour projection (4th extraction method).
 
     Projects channel-normalized RGB traces onto their second principal
@@ -199,7 +204,7 @@ def lgi_project(rgb_traces: np.ndarray, fps: float) -> np.ndarray:
 
     pulse = detrend_signal(pulse)
     pulse = temporal_normalization(pulse, window=max(int(fps * 2), 8))
-    pulse = bandpass_fft(pulse, fps, 0.7, 3.5)
+    pulse = bandpass_fft(pulse, fps, low_hz, high_hz)
     return pulse
 
 
@@ -402,9 +407,10 @@ def estimate_bpm(
 
 
 def compute_periodicity(signal: np.ndarray, fps: float, low_hz: float = 0.7, high_hz: float = 3.5) -> float:
-    """Return a 0-1 periodicity score (spectral concentration near peak).
+    """Return a 0-1 periodicity score using FFT + autocorrelation evidence.
 
-    A strongly periodic pulse signal has most energy at one frequency.
+    This is more tolerant to mild noise than pure spectral concentration and
+    better reflects whether the signal has a repeatable pulse rhythm.
     """
     if len(signal) < 8:
         return 0.0
@@ -420,7 +426,24 @@ def compute_periodicity(signal: np.ndarray, fps: float, low_hz: float = 0.7, hig
     if total < 1e-12:
         return 0.0
     peak = float(np.max(vm))
-    return float(np.clip(peak / total * 3.0, 0.0, 1.0))
+    spectral = float(np.clip(peak / total * 3.0, 0.0, 1.0))
+
+    # Autocorrelation periodicity in the physiological lag range.
+    x = filtered.astype(np.float64)
+    x = x - float(np.mean(x))
+    energy = float(np.dot(x, x))
+    if energy < 1e-12:
+        return spectral
+
+    ac = np.correlate(x, x, mode="full")[len(x) - 1:] / energy
+    min_lag = int(max(1, np.floor(fps / max(high_hz, 1e-6))))
+    max_lag = int(min(len(ac) - 1, np.ceil(fps / max(low_hz, 1e-6))))
+    if max_lag <= min_lag:
+        return spectral
+
+    ac_peak = float(np.max(ac[min_lag:max_lag + 1]))
+    ac_score = float(np.clip((ac_peak - 0.05) / 0.45, 0.0, 1.0))
+    return float(np.clip(0.60 * spectral + 0.40 * ac_score, 0.0, 1.0))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -491,7 +514,7 @@ def compute_hr_timeseries(
     stride_sec: float = 0.5,
     low_hz: float = 0.7,
     high_hz: float = 3.5,
-    min_window_quality: float = 0.10,
+    min_window_quality: float = 0.06,
 ) -> List[Dict[str, Any]]:
     """Sliding-window BPM estimates for heart-rate graphing.
 
@@ -688,7 +711,7 @@ def robust_hr_consensus(
                 rejected_windows.append(bad)
 
     # Peak-quality validation proxy from per-window spectrum quality.
-    quality_floor = 0.08
+    quality_floor = 0.03
     by_quality: List[Dict[str, Any]] = []
     for w in candidate_windows:
         if w["quality"] >= quality_floor:
@@ -823,7 +846,7 @@ def robust_hr_consensus(
     # reach consensus when 2+ windows tightly agree, reducing harmonic-jump
     # instability across repeated scans.
     cluster_spread = float(np.max(dominant) - np.min(dominant)) if len(dominant) > 1 else 0.0
-    if len(dominant) < 2 or cluster_spread > 12.0:
+    if len(dominant) < 1 or cluster_spread > 18.0:
         return {
             "has_consensus": False,
             "heart_rate": None,

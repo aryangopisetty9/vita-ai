@@ -64,7 +64,7 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
         debugPrint('[Analysis] Vita score: $score, overall_risk: $riskStr');
       } catch (e) {
         debugPrint('[Analysis] Final-score call failed: $e');
-        score = _estimateScore(risk);
+        score = null;
       }
 
       // Only update HealthData if we have a real score
@@ -74,10 +74,16 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
           module: 'symptom',
           moduleScore: score,
           moduleRisk: riskStr,
+          moduleResult: symptomResult,
         );
       } else {
         HealthData.riskLevel = riskStr;
-        HealthData.addHistoryEntry(risk: riskStr, status: 'symptom analysis', module: 'symptom');
+        HealthData.addHistoryEntry(
+          risk: riskStr,
+          status: 'symptom analysis',
+          module: 'symptom',
+          moduleResult: symptomResult,
+        );
       }
 
       // Inject the computed vita score into result for ResultScreen display
@@ -121,23 +127,10 @@ class _AnalysisScreenState extends State<AnalysisScreen> {
     }
   }
 
-  int _estimateScore(String risk) {
-    switch (risk.toLowerCase()) {
-      case 'low':
-        return 80;
-      case 'moderate':
-        return 55;
-      case 'high':
-        return 30;
-      default:
-        return 50;
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFEDEFF3),
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       body: SafeArea(
         child: Column(
           children: [

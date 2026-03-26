@@ -10,7 +10,8 @@ import '../models/health_data.dart';
 
 class VoiceScreen extends StatefulWidget {
   final int userId;
-  const VoiceScreen({super.key, required this.userId});
+  final String userName;
+  const VoiceScreen({super.key, required this.userId, required this.userName});
 
   @override
   State<VoiceScreen> createState() => _VoiceScreenState();
@@ -179,6 +180,7 @@ class _VoiceScreenState extends State<VoiceScreen>
           module: 'breathing',
           moduleScore: vitaScore,
           moduleRisk: riskStr,
+          moduleResult: result,
         );
       } else {
         HealthData.riskLevel = riskStr;
@@ -186,7 +188,12 @@ class _VoiceScreenState extends State<VoiceScreen>
         final brStr = brVal != null && brVal > 0
             ? 'BR ${brVal.toStringAsFixed(0)} br/min'
             : 'breathing scan';
-        HealthData.addHistoryEntry(risk: riskStr, status: brStr, module: 'breathing');
+        HealthData.addHistoryEntry(
+          risk: riskStr,
+          status: brStr,
+          module: 'breathing',
+          moduleResult: result,
+        );
       }
 
       // Save enriched scan to backend history
@@ -243,7 +250,30 @@ class _VoiceScreenState extends State<VoiceScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFEDEFF3),
+      appBar: AppBar(
+        title: const Text('Voice'),
+        leading: IconButton(
+          icon: const Icon(Icons.home),
+          onPressed: () {
+            Navigator.pushNamedAndRemoveUntil(
+              context,
+              '/home',
+              (route) => false,
+              arguments: {
+                'userId': widget.userId,
+                'userName': widget.userName,
+              },
+            );
+          },
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => Navigator.pop(context),
+          ),
+        ],
+      ),
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(18),

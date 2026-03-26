@@ -47,6 +47,7 @@ class ScanHistoryScreen extends StatefulWidget {
 class _ScanHistoryScreenState extends State<ScanHistoryScreen> {
   List<_ScanItem> _items = [];
   bool _loading = true;
+  bool _isResultDialogOpen = false;
   String? _error;
 
   @override
@@ -178,6 +179,14 @@ class _ScanHistoryScreenState extends State<ScanHistoryScreen> {
       // Offset by index so same-second entries don't collide.
       dt ??= now.subtract(Duration(minutes: entry.key));
 
+      Map<String, dynamic>? resultJson;
+      final rawJson = h['result_json'] ?? '';
+      if (rawJson.isNotEmpty) {
+        try {
+          resultJson = jsonDecode(rawJson) as Map<String, dynamic>;
+        } catch (_) {}
+      }
+
       final scanType = module.isEmpty ? 'session' : module;
       return _ScanItem(
         id: null,
@@ -185,7 +194,7 @@ class _ScanHistoryScreenState extends State<ScanHistoryScreen> {
         vitaScore: vitaScore,
         riskLevel: h['risk'],
         createdAt: dt,
-        resultJson: null,
+        resultJson: resultJson,
         isBackendRecord: false,
       );
     }).toList();
@@ -282,11 +291,9 @@ class _ScanHistoryScreenState extends State<ScanHistoryScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFEDEFF3),
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       appBar: AppBar(
         title: const Text('Scan History'),
-        backgroundColor: Colors.white,
-        foregroundColor: Colors.black87,
         elevation: 0,
         actions: [
           IconButton(
@@ -363,124 +370,847 @@ class _ScanHistoryScreenState extends State<ScanHistoryScreen> {
     final dateLabel = _formatDate(item.createdAt);
     final timeLabel = _formatTime(item.createdAt);
 
-    // Detail rows from result_json
-    final details = <MapEntry<String, String>>[];
-    if (item.resultJson != null) {
-      final r = item.resultJson!;
-      if (r['heart_rate'] != null) {
-        details.add(MapEntry('Heart Rate', '${_fmt(r['heart_rate'])} bpm'));
-      }
-      if (r['heart_rate_confidence'] != null) {
-        details.add(MapEntry(
-            'HR Confidence', _fmtPct(r['heart_rate_confidence'])));
-      }
-      if (r['scan_quality'] != null) {
-        details.add(MapEntry('Scan Quality', _fmtPct(r['scan_quality'])));
-      }
-      if (r['confidence'] != null) {
-        details.add(MapEntry('Confidence', _fmtPct(r['confidence'])));
-      }
-      if (r['risk'] != null) {
-        details.add(MapEntry('Risk (module)', r['risk'].toString()));
-      }
-      if (r['message'] != null && r['message'].toString().isNotEmpty) {
-        details.add(MapEntry('Message', r['message'].toString()));
-      }
-    }
-
     return Card(
       margin: const EdgeInsets.only(bottom: 10),
       shape:
           RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       elevation: 2,
-      child: ExpansionTile(
-        leading: CircleAvatar(
-          backgroundColor: riskColor.withValues(alpha: 0.15),
-          child: Icon(_iconFor(item.scanType), color: riskColor, size: 22),
-        ),
-        title: Text(
-          typeLabel,
-          style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-        ),
-        subtitle: Text(
-          '$dateLabel  $timeLabel'
-          '${item.isBackendRecord ? '' : '  â€¢  session'}',
-          style: const TextStyle(fontSize: 12, color: Colors.black54),
-        ),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (item.vitaScore != null)
-              Padding(
-                padding: const EdgeInsets.only(right: 4),
-                child: Text(
-                  '${item.vitaScore}%',
-                  style: TextStyle(
-                      fontWeight: FontWeight.bold, color: riskColor),
-                ),
-              )
-            else
-              const Padding(
-                padding: EdgeInsets.only(right: 4),
-                child: Text('â€”',
-                    style: TextStyle(color: Colors.black38, fontSize: 13)),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: () => _openResultDialog(item),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+          child: Row(
+            children: [
+              CircleAvatar(
+                backgroundColor: riskColor.withValues(alpha: 0.15),
+                child: Icon(_iconFor(item.scanType), color: riskColor, size: 22),
               ),
-            if (item.riskLevel != null && item.riskLevel!.isNotEmpty)
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-                decoration: BoxDecoration(
-                  color: riskColor.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Text(
-                  item.riskLevel!.toUpperCase(),
-                  style: TextStyle(
-                      fontSize: 10,
-                      fontWeight: FontWeight.bold,
-                      color: riskColor),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      typeLabel,
+                      style: const TextStyle(
+                          fontWeight: FontWeight.w700, fontSize: 15),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '$dateLabel  $timeLabel'
+                      '${item.isBackendRecord ? '' : '  •  session'}',
+                      style:
+                          const TextStyle(fontSize: 12, color: Colors.black54),
+                    ),
+                  ],
                 ),
               ),
-          ],
+              const SizedBox(width: 8),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (item.vitaScore != null)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 4),
+                          child: Text(
+                            '${item.vitaScore}%',
+                            style: TextStyle(
+                                fontWeight: FontWeight.bold, color: riskColor),
+                          ),
+                        )
+                      else
+                        const Padding(
+                          padding: EdgeInsets.only(right: 4),
+                          child: Text('—',
+                              style:
+                                  TextStyle(color: Colors.black38, fontSize: 13)),
+                        ),
+                      if (item.riskLevel != null && item.riskLevel!.isNotEmpty)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 7, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: riskColor.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Text(
+                            item.riskLevel!.toUpperCase(),
+                            style: TextStyle(
+                                fontSize: 10,
+                                fontWeight: FontWeight.bold,
+                                color: riskColor),
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  IconButton(
+                    tooltip: 'Delete scan',
+                    icon: const Icon(Icons.delete_outline, size: 20),
+                    color: Colors.red.shade400,
+                    splashRadius: 18,
+                    constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+                    onPressed: () => _confirmDelete(item, index),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
-        children: [
+      ),
+    );
+  }
+
+  Future<void> _openResultDialog(_ScanItem item) async {
+    if (_isResultDialogOpen || !mounted) return;
+    _isResultDialogOpen = true;
+    try {
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: true,
+        builder: (ctx) {
+          final payload = _resultPayload(item);
+          final headerRisk = _effectiveRisk(item, payload);
+          final headerColor = _riskColor(headerRisk);
+          return Dialog(
+            backgroundColor: Colors.transparent,
+            insetPadding:
+                const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 640),
+              child: Stack(
+                children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              CircleAvatar(
+                                backgroundColor: headerColor.withValues(alpha: 0.15),
+                                child: Icon(_iconFor(item.scanType),
+                                    color: headerColor, size: 22),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      _scanLabel(item.scanType),
+                                      style: const TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      '${_formatDate(item.createdAt)}  ${_formatTime(item.createdAt)}',
+                                      style: const TextStyle(
+                                          fontSize: 12,
+                                          color: Colors.black54),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          _buildFullResultContent(item, payload),
+                          if (!item.isBackendRecord) ...[
+                            const SizedBox(height: 14),
+                            _detailRow('Source', 'Session (not yet synced)',
+                                muted: true),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                  Positioned(
+                    right: 6,
+                    top: 6,
+                    child: IconButton(
+                      tooltip: 'Close',
+                      icon: const Icon(Icons.close),
+                      onPressed: () => Navigator.of(ctx).pop(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      );
+    } finally {
+      _isResultDialogOpen = false;
+    }
+  }
+
+  Widget _buildFullResultContent(_ScanItem item, Map<String, dynamic> payload) {
+    final type = _normalizedType(item.scanType);
+    if (type == 'face') return _buildFaceResultContent(item, payload);
+    if (type == 'breathing') return _buildBreathingResultContent(item, payload);
+    if (type == 'symptom') return _buildSymptomResultContent(item, payload);
+
+    final details = _buildGenericDetails(payload);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (item.vitaScore == null)
+          _detailRow('Vita Score', 'Not available for this scan', muted: true),
+        ...details.map((e) => _detailRow(e.key, e.value)),
+      ],
+    );
+  }
+
+  Widget _buildFaceResultContent(_ScanItem item, Map<String, dynamic> p) {
+    final hr = _toDouble(p['heart_rate']);
+    final displayHr = hr;
+    final resultAvailable = p['result_available'] == true;
+    final tier = (p['hr_result_tier']?.toString().toLowerCase() ?? '').trim();
+    final estimatedWeak = p['estimated_from_weak_signal'] == true;
+    final confidence = _toDouble(p['confidence']) ?? 0.0;
+    final reliability = p['reliability']?.toString();
+    final scanQuality = _toDouble(p['scan_quality']);
+    final stability = p['stability']?.toString();
+    final warning = p['warning']?.toString();
+    final message = p['message']?.toString() ?? '';
+    final retake = p['retake_required'] == true;
+    final retakeReasons = p['retake_reasons'];
+    final risk = _effectiveRisk(item, p);
+    final score = _effectiveVitaScore(item, p);
+
+    final isReliable = (reliability ?? '').toLowerCase() != 'unreliable';
+    final fallbackValid =
+      displayHr != null && displayHr > 0 && confidence >= 0.2 && isReliable;
+    final isStrong = tier == 'strong_accept';
+    final isWeak = tier == 'weak_accept' || estimatedWeak;
+    final isReject = tier == 'reject' || tier == 'result_unavailable';
+    final legacyAvailable = isStrong || isWeak || (tier.isEmpty && fallbackValid);
+    final isValidHr =
+      displayHr != null && displayHr > 0 && ((p.containsKey('result_available') ? resultAvailable : legacyAvailable)) && !isReject;
+    debugPrint(
+      'HR DEBUG => value=$displayHr confidence=$confidence reliability=$reliability tier=$tier weak=$isWeak isValid=$isValidHr',
+    );
+
+    final hasHr = isValidHr;
+    final lowConf = confidence < 0.4 || isWeak;
+    final hasWarnings =
+      !isValidHr || lowConf || retake || (warning != null && warning.isNotEmpty);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _scoreBadge(score, risk),
+        const SizedBox(height: 14),
+        Center(
+          child: Column(children: [
+            Text(
+              hasHr ? displayHr.toStringAsFixed(0) : '—',
+              style: TextStyle(
+                fontSize: 78,
+                fontWeight: FontWeight.w700,
+                color: hasHr ? const Color(0xFF1A2340) : Colors.grey,
+                height: 1.0,
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text('bpm',
+                style: TextStyle(
+                    fontSize: 17,
+                    color: Colors.grey.shade600,
+                    fontWeight: FontWeight.w500)),
+            const SizedBox(height: 4),
+            Text(
+              hasHr
+                  ? 'Heart Rate'
+                  : '-- bpm • No reliable pulse detected. Try again with better lighting and less movement.',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+              textAlign: TextAlign.center,
+            ),
+          ]),
+        ),
+        const SizedBox(height: 18),
+        const Divider(height: 1),
+        const SizedBox(height: 12),
+        _resultMetricRow(
+          Icons.show_chart,
+          'Confidence',
+          '${(confidence * 100).toStringAsFixed(1)}%',
+          _confidenceColor(confidence),
+        ),
+        _resultMetricRow(
+          Icons.flag_outlined,
+          'Result Tier',
+          isValidHr
+            ? (isWeak ? 'RESULT AVAILABLE (ESTIMATED)' : 'RESULT AVAILABLE')
+            : 'RESULT UNAVAILABLE',
+          isStrong
+              ? Colors.green.shade700
+              : isWeak
+                  ? Colors.orange.shade700
+                  : Colors.red.shade600,
+        ),
+        if (reliability != null)
+          _resultMetricRow(
+            Icons.verified_outlined,
+            'Reliability',
+            reliability.toUpperCase(),
+            _reliabilityColor(reliability),
+          ),
+        if (scanQuality != null)
+          _resultMetricRow(
+            Icons.high_quality_outlined,
+            'Scan Quality',
+            '${(scanQuality * 100).toStringAsFixed(0)}%',
+            _qualityColor(scanQuality),
+          ),
+        if (stability != null)
+          _resultMetricRow(
+            Icons.timeline_outlined,
+            'Stability',
+            stability.toUpperCase(),
+            _stabilityColor(stability),
+          ),
+        if (message.isNotEmpty)
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(message,
+                style: const TextStyle(fontSize: 13, color: Color(0xFF6B7280))),
+          ),
+        if (hasWarnings) ...[
+          const SizedBox(height: 16),
+          _warningBox([
+            if (!isValidHr)
+              _warningRow(
+                Icons.error_outline,
+                Colors.red.shade700,
+                'No reliable pulse detected',
+              ),
+            if (!isValidHr)
+              _warningRow(
+                Icons.light_mode_outlined,
+                Colors.orange.shade800,
+                'Try again with better lighting and less movement',
+              ),
+            if (lowConf)
+              _warningRow(
+                Icons.info_outline,
+                Colors.amber.shade800,
+                isWeak
+                    ? 'Estimated from weak signal'
+                    : 'Low confidence — weak signal detected',
+              ),
+            if (isWeak)
+              _warningRow(
+                Icons.autorenew,
+                Colors.orange.shade800,
+                'Retake recommended',
+              ),
+            if (retake)
+              _warningRow(
+                Icons.refresh,
+                Colors.orange.shade800,
+                retakeReasons is List && retakeReasons.isNotEmpty
+                    ? 'Retake recommended: ${retakeReasons.join(', ')}'
+                    : 'Retake recommended for better accuracy',
+              ),
+            if (!retake && warning != null && warning.isNotEmpty)
+              _warningRow(
+                Icons.warning_amber_outlined,
+                Colors.orange.shade800,
+                warning,
+              ),
+          ]),
+        ],
+        _buildAdditionalDetails(p, const {
+          'heart_rate',
+          'hr_result_tier',
+          'estimated_from_weak_signal',
+          'confidence',
+          'reliability',
+          'scan_quality',
+          'stability',
+          'warning',
+          'retake_required',
+          'retake_reasons',
+          'message',
+          'risk',
+          'overall_risk',
+          'vita_health_score',
+        }),
+      ],
+    );
+  }
+
+  Widget _buildBreathingResultContent(_ScanItem item, Map<String, dynamic> p) {
+    final br = _toDouble(p['breathing_rate']);
+    final confidence = _toDouble(p['confidence']) ?? 0.0;
+    final reliability = p['reliability']?.toString().toLowerCase();
+    final warning = p['warning']?.toString();
+    final message = p['message']?.toString() ?? '';
+    final retake = p['retake_required'] == true;
+    final retakeReasons = p['retake_reasons'];
+    final brNormalLow = _toDouble(p['breathing_rate_normal_low']);
+    final brNormalHigh = _toDouble(p['breathing_rate_normal_high']);
+    final risk = _effectiveRisk(item, p);
+    final score = _effectiveVitaScore(item, p);
+
+    final hasBr = br != null && br > 0;
+    final lowConf = confidence < 0.33;
+    final hasWarnings = lowConf || retake || (warning != null && warning.isNotEmpty);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _scoreBadge(score, risk),
+        const SizedBox(height: 14),
+        Center(
+          child: Column(children: [
+            Text(
+              hasBr ? br.toStringAsFixed(0) : '—',
+              style: TextStyle(
+                fontSize: 78,
+                fontWeight: FontWeight.w700,
+                color: hasBr ? const Color(0xFF1A2340) : Colors.grey,
+                height: 1.0,
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              'breaths / min',
+              style: TextStyle(
+                  fontSize: 17,
+                  color: Colors.grey.shade600,
+                  fontWeight: FontWeight.w500),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              brNormalLow != null && brNormalHigh != null
+                  ? 'Normal: ${brNormalLow.toStringAsFixed(0)}–${brNormalHigh.toStringAsFixed(0)} breaths/min'
+                  : hasBr
+                      ? _breathingLabel(risk)
+                      : 'Unable to estimate breathing rate',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+            ),
+          ]),
+        ),
+        const SizedBox(height: 18),
+        const Divider(height: 1),
+        const SizedBox(height: 12),
+        _resultMetricRow(Icons.air, 'Assessment', _breathingLabel(risk), _voiceRiskColor(risk)),
+        _resultMetricRow(
+          Icons.show_chart,
+          'Confidence',
+          '${(confidence * 100).toStringAsFixed(1)}%',
+          _confidenceColor(confidence),
+        ),
+        if (reliability != null)
+          _resultMetricRow(
+            Icons.verified_outlined,
+            'Reliability',
+            reliability.toUpperCase(),
+            _reliabilityColor(reliability),
+          ),
+        if (message.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(message,
+                style: const TextStyle(fontSize: 13, color: Color(0xFF6B7280))),
+          ),
+        if (hasWarnings) ...[
+          const SizedBox(height: 16),
+          _warningBox([
+            if (lowConf)
+              _warningRow(
+                Icons.info_outline,
+                Colors.amber.shade800,
+                'Low confidence — weak breathing signal detected',
+              ),
+            if (retake)
+              _warningRow(
+                Icons.refresh,
+                Colors.orange.shade800,
+                retakeReasons is List && retakeReasons.isNotEmpty
+                    ? retakeReasons.first.toString()
+                    : 'Retake recommended for better accuracy',
+              ),
+            if (!retake && warning != null && warning.isNotEmpty)
+              _warningRow(
+                Icons.warning_amber_outlined,
+                Colors.orange.shade800,
+                warning,
+              ),
+          ]),
+        ],
+        _buildAdditionalDetails(p, const {
+          'breathing_rate',
+          'breathing_rate_normal_low',
+          'breathing_rate_normal_high',
+          'confidence',
+          'reliability',
+          'warning',
+          'retake_required',
+          'retake_reasons',
+          'message',
+          'risk',
+          'overall_risk',
+          'vita_health_score',
+        }),
+      ],
+    );
+  }
+
+  Widget _buildSymptomResultContent(_ScanItem item, Map<String, dynamic> p) {
+    final risk = _effectiveRisk(item, p);
+    final score = _effectiveVitaScore(item, p);
+    final statusPoints = _buildStatusPoints(p, risk);
+    final recommendations = _buildRecommendations(p, risk);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _scoreBadge(score, risk),
+        const SizedBox(height: 14),
+        Card(
+          elevation: 0,
+          color: Colors.grey.shade50,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          child: Padding(
+            padding: const EdgeInsets.all(14),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Divider(height: 1),
-                const SizedBox(height: 8),
-                // Score unavailable note
-                if (item.vitaScore == null)
-                  _detailRow(
-                    'Vita Score',
-                    'Not available for this scan',
-                    muted: true,
+                Row(children: [
+                  Icon(Icons.monitor_heart, color: _riskColor(risk)),
+                  const SizedBox(width: 8),
+                  const Text(
+                    'Health Status',
+                    style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
                   ),
-                ...details.map(
-                    (e) => _detailRow(e.key, e.value)),
-                if (!item.isBackendRecord)
-                  _detailRow('Source', 'Session (not yet synced)',
-                      muted: true),
-                const SizedBox(height: 8),
-                // Delete button
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: TextButton.icon(
-                    style: TextButton.styleFrom(
-                        foregroundColor: Colors.red.shade400),
-                    icon: const Icon(Icons.delete_outline, size: 18),
-                    label: const Text('Delete scan'),
-                    onPressed: () => _confirmDelete(item, index),
-                  ),
-                ),
+                ]),
+                const Divider(),
+                ...statusPoints.map((p) => Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('• ', style: TextStyle(fontSize: 16)),
+                          Expanded(child: Text(p, style: const TextStyle(fontSize: 15))),
+                        ],
+                      ),
+                    )),
               ],
             ),
           ),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          elevation: 0,
+          color: Colors.grey.shade50,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(children: const [
+                  Icon(Icons.tips_and_updates, color: Colors.amber),
+                  SizedBox(width: 8),
+                  Text(
+                    'Recommendations',
+                    style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+                  ),
+                ]),
+                const Divider(),
+                ...recommendations.map((r) => Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Icon(Icons.check_circle, size: 18, color: Colors.green),
+                          const SizedBox(width: 8),
+                          Expanded(child: Text(r, style: const TextStyle(fontSize: 15))),
+                        ],
+                      ),
+                    )),
+              ],
+            ),
+          ),
+        ),
+        _buildAdditionalDetails(p, const {
+          'predicted_condition',
+          'severity',
+          'risk',
+          'confidence',
+          'reliability',
+          'message',
+          'recommendations',
+          'overall_risk',
+          'vita_health_score',
+        }),
+      ],
+    );
+  }
+
+  Widget _scoreBadge(int? score, String risk) {
+    if (score != null && score > 0) {
+      final color = _scoreColor(score);
+      return Center(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Text(
+            'Vita Score: $score%  •  ${risk.toUpperCase()}',
+            style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: color),
+          ),
+        ),
+      );
+    }
+    return Center(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+        decoration: BoxDecoration(
+          color: Colors.grey.shade200,
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Text(
+          'Vita Score unavailable for this saved scan',
+          style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
+        ),
+      ),
+    );
+  }
+
+  List<String> _buildStatusPoints(Map<String, dynamic> result, String risk) {
+    final points = <String>[];
+    final condition = result['predicted_condition']?.toString();
+    if (condition != null && condition.isNotEmpty) {
+      points.add('Predicted condition: $condition');
+    }
+
+    final severity = result['severity']?.toString();
+    if (severity != null && severity.isNotEmpty) {
+      points.add('Severity: $severity');
+    }
+
+    final hr = _toDouble(result['heart_rate']);
+    final resultAvailable = result['result_available'] == true;
+    final tier = (result['hr_result_tier']?.toString().toLowerCase() ?? '').trim();
+    final estimatedWeak = result['estimated_from_weak_signal'] == true;
+    final hrConfidence = _toDouble(result['confidence']) ?? 0.0;
+    final hrReliability = result['reliability']?.toString().toLowerCase() ?? '';
+    final fallbackValid = hr != null && hr > 0 && hrConfidence >= 0.2 && hrReliability != 'unreliable';
+    final isStrong = tier == 'strong_accept';
+    final isWeak = tier == 'weak_accept' || estimatedWeak;
+    final isReject = tier == 'reject' || tier == 'result_unavailable';
+    final legacyAvailable = isStrong || isWeak || (tier.isEmpty && fallbackValid);
+    final isValidHr = hr != null && hr > 0 && ((result.containsKey('result_available') ? resultAvailable : legacyAvailable)) && !isReject;
+    if (isValidHr) {
+      points.add('Heart Rate: ${hr.toStringAsFixed(0)} bpm');
+      if (isWeak) {
+        points.add('Estimated from weak signal');
+        points.add('Retake recommended');
+      }
+    } else {
+      points.add('No reliable pulse detected');
+      points.add('Try again with better lighting and less movement');
+    }
+
+    final stability = result['stability']?.toString();
+    if (stability != null && stability.isNotEmpty) {
+      points.add('Stability: $stability');
+    }
+
+    final br = result['breathing_rate'];
+    if (br != null) points.add('Breathing Rate: $br breaths/min');
+
+    points.add('Risk Level: ${risk.toUpperCase()}');
+
+    final confidence = _toDouble(result['confidence']);
+    if (confidence != null) {
+      points.add('Confidence: ${(confidence * 100).round()}%');
+    }
+
+    final reliability = result['reliability']?.toString();
+    if (reliability != null && reliability.isNotEmpty) {
+      points.add('Reliability: ${reliability.toUpperCase()}');
+    }
+
+    final message = result['message']?.toString();
+    if (message != null && message.isNotEmpty) points.add(message);
+    return points;
+  }
+
+  List<String> _buildRecommendations(Map<String, dynamic> result, String risk) {
+    if (result['recommendations'] is List) {
+      return (result['recommendations'] as List)
+          .map((e) => e.toString())
+          .where((e) => e.trim().isNotEmpty)
+          .toList();
+    }
+
+    final recs = <String>[];
+    final r = risk.toLowerCase();
+    if (r == 'high' || r == 'very_high') {
+      recs.add('Consider consulting a healthcare professional soon.');
+      recs.add('Monitor your symptoms closely.');
+    } else if (r == 'moderate' || r == 'elevated') {
+      recs.add('Keep tracking your symptoms over the next few days.');
+      recs.add('Rest and stay hydrated.');
+    } else {
+      recs.add('Your results look stable. Keep healthy routines.');
+    }
+    recs.add('Stay hydrated and maintain a balanced diet.');
+    recs.add('If symptoms persist, consult a healthcare provider.');
+    return recs;
+  }
+
+  Widget _buildAdditionalDetails(Map<String, dynamic> p, Set<String> excludedKeys) {
+    final rows = _buildGenericDetails(p, excludedKeys: excludedKeys);
+    if (rows.isEmpty) return const SizedBox.shrink();
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Divider(height: 1),
+          const SizedBox(height: 10),
+          const Text(
+            'Additional Details',
+            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 6),
+          ...rows.map((e) => _detailRow(e.key, e.value)),
         ],
       ),
     );
+  }
+
+  List<MapEntry<String, String>> _buildGenericDetails(
+    Map<String, dynamic> payload, {
+    Set<String> excludedKeys = const {},
+  }) {
+    final details = <MapEntry<String, String>>[];
+
+    for (final entry in payload.entries) {
+      final key = entry.key.toString();
+      if (excludedKeys.contains(key)) continue;
+      final value = entry.value;
+      if (value == null || value is Map || value is List) continue;
+
+      var text = value.toString().trim();
+      if (text.isEmpty) continue;
+
+      if (key.contains('confidence') || key.contains('quality')) {
+        text = _fmtPct(value);
+      }
+
+      details.add(MapEntry(_titleCase(key.replaceAll('_', ' ')), text));
+    }
+
+    return details;
+  }
+
+  Widget _resultMetricRow(IconData icon, String label, String value, Color color) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(children: [
+        Icon(icon, size: 17, color: color),
+        const SizedBox(width: 10),
+        Text(label,
+            style: const TextStyle(fontSize: 14, color: Color(0xFF444A5A))),
+        const Spacer(),
+        Text(value,
+            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: color)),
+      ]),
+    );
+  }
+
+  Widget _warningBox(List<Widget> children) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.amber.shade50,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.amber.shade300),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: children),
+    );
+  }
+
+  Widget _warningRow(IconData icon, Color color, String text) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Icon(icon, color: color, size: 17),
+        const SizedBox(width: 8),
+        Expanded(child: Text(text, style: TextStyle(fontSize: 13, color: color))),
+      ]),
+    );
+  }
+
+  Map<String, dynamic> _resultPayload(_ScanItem item) {
+    final payload = <String, dynamic>{};
+    if (item.resultJson != null) payload.addAll(item.resultJson!);
+    if (item.vitaScore != null) payload.putIfAbsent('vita_health_score', () => item.vitaScore);
+    if (item.riskLevel != null && item.riskLevel!.isNotEmpty) {
+      payload.putIfAbsent('overall_risk', () => item.riskLevel);
+    }
+    return payload;
+  }
+
+  String _effectiveRisk(_ScanItem item, Map<String, dynamic> payload) {
+    final risk = payload['overall_risk']?.toString() ??
+        payload['risk']?.toString() ??
+        item.riskLevel ??
+        'unknown';
+    return risk.toLowerCase();
+  }
+
+  int? _effectiveVitaScore(_ScanItem item, Map<String, dynamic> payload) {
+    if (item.vitaScore != null) return item.vitaScore;
+    final dynamic raw = payload['vita_health_score'];
+    if (raw is int) return raw;
+    if (raw is double) return raw.round();
+    if (raw is String) return int.tryParse(raw);
+    return null;
+  }
+
+  String _normalizedType(String type) {
+    final t = type.trim().toLowerCase();
+    if (t == 'audio' || t == 'voice') return 'breathing';
+    return t;
+  }
+
+  double? _toDouble(dynamic v) {
+    if (v == null) return null;
+    if (v is double) return v;
+    if (v is int) return v.toDouble();
+    if (v is String) return double.tryParse(v);
+    return null;
+  }
+
+  String _titleCase(String text) {
+    return text
+        .split(' ')
+        .where((w) => w.isNotEmpty)
+        .map((w) => '${w[0].toUpperCase()}${w.substring(1)}')
+        .join(' ');
   }
 
   Widget _detailRow(String label, String value,
@@ -540,11 +1270,6 @@ class _ScanHistoryScreenState extends State<ScanHistoryScreen> {
         '${dt.minute.toString().padLeft(2, '0')}';
   }
 
-  String _fmt(dynamic v) {
-    if (v is double) return v.toStringAsFixed(1);
-    return v.toString();
-  }
-
   String _fmtPct(dynamic v) {
     double? d;
     if (v is double) d = v;
@@ -571,6 +1296,96 @@ class _ScanHistoryScreenState extends State<ScanHistoryScreen> {
         return Icons.assessment;
       default:
         return Icons.health_and_safety;
+    }
+  }
+
+  Color _scoreColor(int score) {
+    if (score >= 70) return Colors.green.shade700;
+    if (score >= 40) return Colors.orange.shade700;
+    return Colors.red.shade600;
+  }
+
+  Color _confidenceColor(double v) {
+    if (v >= 0.7) return Colors.green.shade700;
+    if (v >= 0.4) return Colors.orange.shade700;
+    return Colors.red.shade600;
+  }
+
+  Color _reliabilityColor(String? r) {
+    if (r == null) return Colors.grey.shade600;
+    switch (r.toLowerCase()) {
+      case 'high':
+        return Colors.green.shade700;
+      case 'medium':
+      case 'moderate':
+        return Colors.orange.shade700;
+      case 'low':
+      case 'unreliable':
+        return Colors.red.shade600;
+      default:
+        return Colors.grey.shade600;
+    }
+  }
+
+  Color _qualityColor(double v) {
+    if (v >= 0.6) return Colors.green.shade700;
+    if (v >= 0.35) return Colors.orange.shade700;
+    return Colors.red.shade600;
+  }
+
+  Color _stabilityColor(String? s) {
+    if (s == null) return Colors.grey.shade600;
+    switch (s.toLowerCase()) {
+      case 'stable':
+      case 'good':
+        return Colors.green.shade700;
+      case 'moderate':
+        return Colors.orange.shade700;
+      case 'unstable':
+      case 'poor':
+        return Colors.red.shade600;
+      default:
+        return Colors.grey.shade600;
+    }
+  }
+
+  String _breathingLabel(String risk) {
+    switch (risk.toLowerCase()) {
+      case 'normal':
+      case 'low':
+        return 'Normal Range';
+      case 'elevated':
+      case 'moderate':
+        return 'Above Resting Range';
+      case 'high':
+        return 'Exercise Range';
+      case 'very_high':
+        return 'Very High Rate';
+      case 'low_rate':
+        return 'Below Normal Rate';
+      case 'unreliable':
+        return 'No Signal';
+      default:
+        return risk.toUpperCase();
+    }
+  }
+
+  Color _voiceRiskColor(String risk) {
+    switch (risk.toLowerCase()) {
+      case 'normal':
+      case 'low':
+        return Colors.green.shade700;
+      case 'elevated':
+      case 'moderate':
+        return Colors.orange.shade600;
+      case 'high':
+        return Colors.deepOrange.shade600;
+      case 'very_high':
+        return Colors.red.shade600;
+      case 'low_rate':
+        return Colors.blue.shade700;
+      default:
+        return Colors.grey.shade600;
     }
   }
 
